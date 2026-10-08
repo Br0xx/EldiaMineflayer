@@ -83,7 +83,9 @@ The promises of these APIs settle after that tick, so a call now takes up to 50 
 - **Containers:** opens are spaced 1.5 s apart, because 9b9t silently ignores faster ones. A window that arrives too
   late is closed.
 - **Offhand:** `bot.vanilla.swapHands()`, `offhandFromHotbar()` and `toHotbar()` move items the way a player does.
-- **Window clicks and closes** wait until no movement key is held.
+- **Window clicks and closes** wait until no movement key is held (Grim flags inventory clicks while moving). They
+  reject after 40 ticks if a key stays held, so release the keys first (`bot.clearControlStates()`), as
+  mineflayer-pathfinder does when it stops.
 
 **Connection defaults for 9b9t.**
 
