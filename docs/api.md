@@ -104,6 +104,11 @@
       - [bot.usingHeldItem](#botusinghelditem)
       - [bot.sprinting](#botsprinting)
       - [bot.crouching](#botcrouching)
+      - [bot.pose](#botpose)
+      - [bot.tickCount](#bottickcount)
+      - [bot.kickReason](#botkickreason)
+      - [bot.serverBrand](#botserverbrand)
+      - [bot.serverVersion](#botserverversion)
       - [bot.game.levelType](#botgameleveltype)
       - [bot.game.dimension](#botgamedimension)
       - [bot.game.difficulty](#botgamedifficulty)
@@ -242,6 +247,8 @@
       - ["usedFirework" (fireworkEntityId)](#usedfirework-fireworkentityid)
       - ["move"](#move)
       - ["forcedMove"](#forcedmove)
+      - ["teleport" (teleport)](#teleport-teleport)
+      - ["windowClosedForMovement" (window)](#windowclosedformovement-window)
       - ["mount"](#mount)
       - ["dismount" (vehicle)](#dismount-vehicle)
       - ["windowOpen" (window)](#windowopen-window)
@@ -265,6 +272,9 @@
       - ["bossBarUpdated" (bossBar)](#bossbarupdated-bossbar)
       - ["heldItemChanged" (heldItem)](#helditemchanged-helditem)
       - ["physicsTick" ()](#physicstick-)
+      - ["tick" ({ n, packets })](#tick--n-packets-)
+      - ["playerLoaded"](#playerloaded)
+      - ["actionRejected" ({ action, code, detail })](#actionrejected--action-code-detail-)
       - ["chat:name" (matches)](#chatname-matches)
       - ["particle"](#particle)
     - [Functions](#functions)
@@ -985,6 +995,30 @@ The state the last tick was simulated with. `bot.setControlState('sprint', true)
 sprints while it moves forward and may, by the rules of the vanilla client (enough food, not sneaking, not using an item,
 not against a wall...). `bot.crouching` follows the sneak key one tick later, like the pose of the vanilla client.
 
+#### bot.pose
+
+`'standing'`, `'crouching'`, `'swimming'`, `'crawling'` (the swimming pose out of the water) or `'gliding'`, as the last
+tick left it. Before 1.21 only `'standing'` and `'crouching'`.
+
+#### bot.tickCount
+
+The physics ticks run so far (play state only). See the `"tick"` event.
+
+#### bot.kickReason
+
+Why the server kicked the bot, as plain text (`ChatMessage.fromNotch(reason).toString()`), or `null`. It is set before
+`"kicked"` is emitted.
+
+#### bot.serverBrand
+
+The brand the server sent on its brand channel ('vanilla', 'Paper'...), or `null` until it did. Same as
+`bot.game.serverBrand`.
+
+#### bot.serverVersion
+
+The version name from the server's status ping (such as 'Paper 1.21.4'). minecraft-protocol only pings when it
+detects the version (`version: false`); with a fixed version this stays `null`.
+
 #### bot.game.levelType
 
 #### bot.game.dimension
@@ -1424,7 +1458,7 @@ Emitted when the server sends a time update. See `bot.time`.
 Emitted when the bot is kicked from the server. `reason`
 is a chat message explaining why you were kicked. `loggedIn`
 is `true` if the client was kicked after successfully logging in,
-or `false` if the kick occurred in the login phase.
+or `false` if the kick occurred in the login phase. `bot.kickReason` holds the reason as plain text.
 
 #### "end" (reason)
 
@@ -1621,6 +1655,19 @@ Fires when the bot moves. If you want the current position, use
 Fires when the bot is force moved by the server (teleport, spawning, ...). If you want the current position, use
 `bot.entity.position`.
 
+#### "teleport" (teleport)
+
+Fires when a position packet arrives, before the reply goes out (the next tick). `teleport` is `{ id, position, yaw,
+pitch, flags, velocity, requested }`: where the packet put the bot (relative flags resolved, the rotation in degrees as
+in the packet) and the bot's velocity after it. `requested` is true for the first one within 10 s of a login, respawn or
+dimension change, which is the server placing the bot. Any other one is a setback candidate (or a plugin's teleport).
+`id` is missing before 1.9.
+
+#### "windowClosedForMovement" (window)
+
+Fires when a movement key was pressed with a window open and the bot closed the window first: a vanilla client cannot
+walk with a screen up, and a server may drop the move.
+
 #### "mount"
 
 Fires when you mount an entity such as a minecart. To get access
@@ -1715,6 +1762,24 @@ Fires when the held item is changed.
 #### "physicsTick" ()
 
 Fires every tick if bot.physicsEnabled is set to true.
+
+#### "tick" ({ n, packets })
+
+Fires after each physics tick (its `tick_end` is written), also when `bot.physicsEnabled` is false. `n` is
+`bot.tickCount` of that tick and `packets` the names of the packets written in it, in order. The list is only collected
+while a listener is attached.
+
+#### "playerLoaded"
+
+Fires after the `player_loaded` packet is written (1.21.4+): the bot has been placed and its chunk is there.
+
+#### "actionRejected" ({ action, code, detail })
+
+An aimed action was refused before any packet was written. `action` is `'dig'`, `'place'`, `'attack'`, `'use'` or
+`'click'` (`bot.vanilla.clickBlock`), `code` one of `'too-far'`, `'no-sight'`, `'moved'` or `'gone'` (the `err.code` the
+call rejects with) and `detail` a sentence. An entity action that kept moving is retried, so `'moved'` can come more
+than once for a call. `bot._input.stats` counts them: `rejected` by code, `deferred` (actions that waited a tick behind
+another) and `droppedTicks` (ticks a stalled event loop lost, see `maxCatchupTicks`).
 
 #### "chat:name" (matches)
 

@@ -1,13 +1,13 @@
 // One bot connection with everything the bench watches on it:
 //   - a ring of the packets in both directions with tick markers (lib/trace.js)
-//   - test/grimLint.js over the outgoing stream
+//   - lib/tools/grimLint.js over the outgoing stream
 //   - setbacks: a server position packet that no login, respawn or scenario asked for
 //   - kicks, errors, anticheat-looking chat, stalled ticks
 // It writes into the current Frame (the scenario that runs). The bot never chats unless --commands is given.
 const path = require('path')
 const { EventEmitter } = require('events')
 const mineflayer = require('../..')
-const grimLint = require('../../test/grimLint')
+const grimLint = require('../../lib/tools/grimLint')
 const { Frame } = require('./frame')
 const { NOISE_IN, brief, formatRecord, window } = require('./trace')
 const { sleep, round } = require('./util')
@@ -118,7 +118,7 @@ class Session extends EventEmitter {
     bot.once('forcedMove', () => { info.firstForcedMoveMs = since() })
     bot.on('forcedMove', () => { this.f.forcedMoves++ })
     bot.on('kicked', (reason) => {
-      this.kickReason = textOf(reason, bot.registry)
+      this.kickReason = bot.kickReason ?? textOf(reason, bot.registry)
       this.kickRecorded = true
       if (!this.expectEnd) this.f.addKick('kicked', this.kickReason)
     })
@@ -177,6 +177,12 @@ class Session extends EventEmitter {
   attach (bot) {
     const client = bot._client
     this.hasTickEnd = bot.supportFeature('sendsClientTickEndPacket')
+    // The library reports teleports itself (and says which one it asked for); an older one is read off the packets
+    this.hooked = typeof bot.tickCount === 'number'
+    if (this.hooked) {
+      bot.on('teleport', (t) => this.onTeleport({ to: this.shift(t.position.x, t.position.y, t.position.z), teleportId: t.id }, t.requested))
+      bot.on('actionRejected', (r) => this.f.note(`${r.action} refused: ${r.code}${r.detail ? ` (${r.detail})` : ''}`))
+    }
     if (this.opts.lint !== false) this.lint = grimLint(bot, { players: this.players, report: (id, msg) => this.f.addViolation(id, msg) })
     const original = client.write
     const session = this
@@ -230,22 +236,33 @@ class Session extends EventEmitter {
     }
     const rec = this.push('in', name, noise ? '' : brief('in', name, data, this.shift), noise)
     if (state && state !== 'play') return
-    if (name === 'login' || name === 'respawn') this.expectedTeleports++
-    else if (name === 'position') this.onTeleport(data)
+    if (this.hooked) {
+      if (name === 'player_rotation') this.f.serverRotations++
+    } else if (name === 'login' || name === 'respawn') this.expectedTeleports++
+    else if (name === 'position') this.onTeleport(this.teleportOf(data))
     else if (name === 'player_rotation') this.f.serverRotations++
     this.emit('in', rec, data)
   }
 
-  onTeleport (p) {
+  // Where a raw position packet puts the bot, relative to the origin (a relative axis is added to the last position)
+  teleportOf (p) {
     const prev = this.history.at(-1)
     const e = this.bot.entity
     const base = prev ? prev.pos : e?.position ? this.rel(e.position) : [0, 0, 0]
     const o = this.origin ?? { x: 0, y: 0, z: 0 }
     const fl = p.flags
     const rel = typeof fl === 'number' ? { x: fl & 1, y: fl & 2, z: fl & 4 } : { x: fl?.x, y: fl?.y, z: fl?.z }
-    const to = [rel.x ? base[0] + p.x : p.x - o.x, rel.y ? base[1] + p.y : p.y - o.y, rel.z ? base[2] + p.z : p.z - o.z]
-    if (this.expectedTeleports > 0) {
-      this.expectedTeleports--
+    return { to: [rel.x ? base[0] + p.x : p.x - o.x, rel.y ? base[1] + p.y : p.y - o.y, rel.z ? base[2] + p.z : p.z - o.z], teleportId: p.teleportId }
+  }
+
+  // `requested` is the library's verdict (login, respawn, dimension change); without it the login and respawn packets
+  // were counted in onIn. A scenario's expectTeleport() counts either way.
+  onTeleport ({ to, teleportId }, requested = null) {
+    const prev = this.history.at(-1)
+    const e = this.bot.entity
+    const base = prev ? prev.pos : e?.position ? this.rel(e.position) : [0, 0, 0]
+    if (requested === true || this.expectedTeleports > 0) {
+      if (requested !== true) this.expectedTeleports--
       this.placedAtTick = this.tick
       this.emit('teleport', { expected: true, to })
       return
@@ -262,7 +279,7 @@ class Session extends EventEmitter {
       distance,
       from: base,
       to,
-      teleportId: p.teleportId,
+      teleportId,
       last5: this.history.slice(-5)
     })
     this.emit('teleport', { expected: false, to, distance })

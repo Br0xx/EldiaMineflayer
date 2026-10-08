@@ -165,6 +165,9 @@ node bench/run.js --host localhost --port 25565 --version 1.21.4 --auth offline 
 node bench/report.js run-a.json run-b.json   # diff two runs
 ```
 
+The bench reads the library's own hooks where they exist (`"teleport"`, `"tick"`, `"playerLoaded"`, `"actionRejected"`,
+`bot.kickReason`, `bot._input.stats`) and falls back to raw packets for an older build.
+
 The bot never chats unless `--commands` is given. See [docs/9bflayer/bench.md](docs/9bflayer/bench.md).
 
 ## Development
@@ -175,7 +178,7 @@ npx standard                                   # lint
 npx mocha --exit test/physicsVanillaTest.js test/internalTest.js test/vanillaUnitTest.js -g "9bflayer|1.21.4v|26.1v|26.2v|26.3v"
 ```
 
-The tests run offline against minecraft-protocol's server. `test/grimLint.js` replays Grim's packet-order rules over
+The tests run offline against minecraft-protocol's server. `lib/tools/grimLint.js` replays Grim's packet-order rules over
 everything a test bot sends, and `test/physicsVanillaTest.js` checks the engine against vanilla numbers.
 
 Nothing here has a local Grim to run against. Live testing happens on 9b9t through EBS Lab, and every finding goes

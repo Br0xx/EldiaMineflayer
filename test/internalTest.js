@@ -3533,7 +3533,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
       })
     })
 
-    // The packets the bot writes, checked against the order rules of the Grim anticheat (test/grimLint.js). Clients
+    // The packets the bot writes, checked against the order rules of the Grim anticheat (lib/tools/grimLint.js). Clients
     // from 1.21.2 on only: they end every tick with tick_end, which is what Grim's windows are built on.
     describe('grimLint', function () {
       this.timeout(30 * 1000)
@@ -4237,6 +4237,111 @@ for (const supportedVersion of mineflayer.testedVersions) {
         while (Date.now() < stallUntil) { /* busy wait */ }
         await sleep(1000)
         assert.ok(lint.ticksPerSecond() <= 22, `${lint.ticksPerSecond()} ticks in a second`)
+      })
+    })
+
+    // The hooks the live bench reads instead of raw packets: teleport, tick, playerLoaded, actionRejected
+    describe('hooks: teleport, tick, playerLoaded, actionRejected', function () {
+      this.timeout(30 * 1000)
+      const noFlags = () => bot.supportFeature('positionPacketHasBitflags') ? { x: false, y: false, z: false, yaw: false, pitch: false } : 0
+      const placement = (teleportId, y = 65) => ({ x: 1.5, y, z: 4.5, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: noFlags(), teleportId })
+      let client
+      const received = []
+
+      // A stone floor at y = 64 and the bot placed at (1.5, 65, 4.5). `listen` runs before the first packet is written.
+      async function join (listen) {
+        const chunk = bot.test.buildChunk()
+        for (let x = 0; x < 16; x++) for (let z = 0; z < 16; z++) chunk.setBlockType(vec3(x, 64, z), registry.blocksByName.stone.id)
+        received.length = 0
+        await new Promise(resolve => {
+          server.on('playerJoin', async (c) => {
+            client = c
+            await bot.test.pluginsLoaded
+            client.on('packet', (data, meta) => received.push(meta.name))
+            if (listen) listen()
+            client.write('login', bot.test.generateLoginPacket())
+            client.write('map_chunk', generateChunkPacket(chunk))
+            client.write('position', placement(0))
+            client.write('update_health', { health: 20, food: 20, foodSaturation: 5 })
+            await once(bot, 'chunkColumnLoad')
+            await sleep(400)
+            resolve()
+          })
+        })
+      }
+
+      it("'teleport' tells the placement after login (requested) from a later one (a setback candidate)", async () => {
+        const seen = []
+        await join(() => bot.on('teleport', t => seen.push(t)))
+        assert.strictEqual(seen.length, 1)
+        assert.strictEqual(seen[0].requested, true)
+        if (version['>=']('1.9')) assert.strictEqual(seen[0].id, 0) // 1.8 positions carry no id
+        assert.deepStrictEqual([seen[0].position.x, seen[0].position.y, seen[0].position.z], [1.5, 65, 4.5])
+        client.write('position', placement(1, 66))
+        await once(bot, 'teleport')
+        assert.strictEqual(seen.length, 2)
+        assert.strictEqual(seen[1].requested, false)
+        if (version['>=']('1.9')) assert.strictEqual(seen[1].id, 1)
+        assert.strictEqual(seen[1].position.y, 66)
+        assert.ok(seen[1].velocity && 'flags' in seen[1] && Number.isFinite(seen[1].yaw) && Number.isFinite(seen[1].pitch))
+      })
+
+      it("'tick' lists the packets of each tick, only while somebody listens; tickCount counts the ticks", async () => {
+        await join()
+        const ticks = []
+        const listener = (t) => ticks.push(t)
+        const before = bot.tickCount
+        bot.on('tick', listener)
+        await bot.waitForTicks(5)
+        bot.removeListener('tick', listener)
+        assert.ok(ticks.length >= 4, `${ticks.length} ticks`)
+        ticks.forEach((t, i) => { if (i) assert.strictEqual(t.n, ticks[i - 1].n + 1) })
+        assert.ok(ticks[0].n > before)
+        for (const t of ticks) {
+          assert.ok(Array.isArray(t.packets) && t.packets.every(n => typeof n === 'string'))
+          if (bot.supportFeature('sendsClientTickEndPacket')) assert.strictEqual(t.packets.at(-1), 'tick_end')
+        }
+        const count = bot.tickCount
+        await bot.waitForTicks(2)
+        assert.ok(bot.tickCount >= count + 2, 'counts without a listener')
+      })
+
+      it('counts the ticks a stalled event loop drops in _input.stats.droppedTicks', async () => {
+        await join()
+        assert.strictEqual(bot._input.stats.droppedTicks, 0)
+        const until = Date.now() + 400
+        while (Date.now() < until);
+        await bot.waitForTicks(3)
+        assert.ok(bot._input.stats.droppedTicks >= 3, `dropped ${bot._input.stats.droppedTicks}`)
+      })
+
+      it("'playerLoaded' follows the player_loaded packet", async function () {
+        if (!bot.supportFeature('sendsPlayerLoadedPacket')) return this.skip()
+        let loaded = 0
+        await join(() => bot.on('playerLoaded', () => { loaded++ }))
+        assert.strictEqual(loaded, 1)
+        assert.strictEqual(received.filter(n => n === 'player_loaded').length, 1)
+      })
+
+      it("kickReason holds the reason as plain text when 'kicked' is emitted", async () => {
+        await join()
+        const kicked = new Promise(resolve => bot.once('kicked', () => resolve(bot.kickReason)))
+        assert.strictEqual(bot.kickReason, null)
+        client.write('kick_disconnect', { reason: chatText('Flying is not enabled') })
+        assert.strictEqual(await kicked, 'Flying is not enabled')
+      })
+
+      it("'actionRejected' reports what was refused before a packet was written, and counts it", async () => {
+        const seen = []
+        await join(() => bot.on('actionRejected', r => seen.push(r)))
+        await assert.rejects(bot.attack({ id: 4242 }), { code: 'gone' })
+        await assert.rejects(bot.dig(bot.blockAt(vec3(1, 64, 14))), { code: 'too-far' })
+        const click = await bot.vanilla.clickBlock(bot.blockAt(vec3(1, 64, 14)))
+        assert.deepStrictEqual(click, { ok: false, reason: 'too-far' })
+        await sleep(50)
+        assert.deepStrictEqual(seen.map(r => [r.action, r.code]), [['attack', 'gone'], ['dig', 'too-far'], ['click', 'too-far']])
+        assert.ok(seen.every(r => typeof r.detail === 'string' && r.detail.length > 0))
+        assert.deepStrictEqual(bot._input.stats.rejected, { gone: 1, 'too-far': 2 })
       })
     })
 

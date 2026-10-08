@@ -27,7 +27,7 @@ export interface BotOptions extends ClientOptions {
   difficulty?: number
   chatLengthLimit?: number
   physicsEnabled?: boolean
-  /** @default 4 */
+  /** Ticks replayed after an event-loop stall; longer ones are dropped (`bot._input.stats.droppedTicks`) @default 2 */
   maxCatchupTicks?: number
   client?: Client
   brand?: string
@@ -220,10 +220,30 @@ export interface BotEvents {
   respawn: () => Promise<void> | void
   /** A totem of undying popped (entity_status 35 for the bot) */
   totemUsed: () => Promise<void> | void
+  /**
+   * A clientbound position packet arrived (the server moved the bot). The reply goes out in the next tick.
+   * `requested` is false for any teleport that is not the placement after a login, respawn or dimension change:
+   * those are setback candidates.
+   */
+  teleport: (teleport: TeleportEvent) => Promise<void> | void
+  /** A physics tick is over (tick_end written). Only emitted while somebody listens; `packets` are the names written in it */
+  tick: (tick: { n: number, packets: string[] }) => Promise<void> | void
+  /** `player_loaded` was written (1.21.4+) */
+  playerLoaded: () => Promise<void> | void
+  /** An aimed action (dig, place, attack, use, click) was refused before a packet was written */
+  actionRejected: (rejection: ActionRejection) => Promise<void> | void
+  /** A window was closed because a movement key was pressed while it was open */
+  windowClosedForMovement: (window: Window) => Promise<void> | void
+  blockPlaced: (oldBlock: Block, newBlock: Block) => Promise<void> | void
+  entityPlaced: (entity: Entity) => Promise<void> | void
+  weatherUpdate: () => Promise<void> | void
+  title_times: (fadeIn: number, stay: number, fadeOut: number) => Promise<void> | void
+  title_clear: () => Promise<void> | void
   game: () => Promise<void> | void
   title: (text: string, type: "subtitle" | "title") => Promise<void> | void
   rain: () => Promise<void> | void
   time: () => Promise<void> | void
+  /** `bot.kickReason` holds the reason as plain text by then */
   kicked: (reason: string, loggedIn: boolean) => Promise<void> | void
   /** The watchdog is ending the connection after `silentMs` without a packet; 'end' follows with reason 'watchdog' */
   watchdog: (silentMs: number) => Promise<void> | void
@@ -370,9 +390,38 @@ export interface Bot extends TypedEmitter<BotEvents> {
   _client: Client
   heldItem: Item | null
   usingHeldItem: boolean
+  /** Whether the bot is using an item (eating, drawing a bow...) */
   itemInUse: boolean
+  /** Sprinting by vanilla's rules (the sprint control only asks for it) */
   sprinting: boolean
+  /** The crouching pose, as of the tick that last ran */
   crouching: boolean
+  /** 'crawling' is the swimming pose out of the water. Before 1.21 only 'standing' and 'crouching' */
+  pose: 'standing' | 'crouching' | 'swimming' | 'crawling' | 'gliding'
+  /** Physics ticks run so far (play state only) */
+  tickCount: number
+  /** Why the server kicked the bot, as plain text; null until it did */
+  kickReason: string | null
+  /** The brand the server sent ('vanilla', 'Paper'...); null before it did (same as `bot.game.serverBrand`) */
+  serverBrand: string | null
+  /** The version name the server's status ping reported; only known when the version was auto-detected (`version: false`), else null */
+  serverVersion: string | null
+  isAlive: boolean
+  /** The entity the bot rides */
+  vehicle: Entity | null
+  /** A jump was asked for and not yet simulated */
+  jumpQueued: boolean
+  /** Autojump cooldown in ticks */
+  jumpTicks: number
+  /** 0 to 1 */
+  rainState: number
+  bossBars: BossBar[]
+  targetDigFace: number | null
+  /** `performance.now()` of the last dig packet, null before the first */
+  lastDigTime: number | null
+  uuidToUsername: { [uuid: string]: string }
+  /** Internal: only the counters are public */
+  _input: { stats: InputStats }
   currentWindow: Window | null
   simpleClick: simpleClick
   tablist: Tablist
@@ -438,6 +487,14 @@ export interface Bot extends TypedEmitter<BotEvents> {
   sleep: (bedBlock: Block) => Promise<void>
 
   isABed: (bedBlock: Block) => boolean
+
+  parseBedMetadata: (bedBlock: Block) => { part: boolean, occupied: boolean | number, facing: number, headOffset: Vec3 }
+
+  /** Players in render distance: one match for a string, a list otherwise (null for none) */
+  findPlayer: (filter: string | RegExp | ((entity: Entity) => boolean) | null) => Entity | Entity[] | null
+  findPlayers: (filter: string | RegExp | ((entity: Entity) => boolean) | null) => Entity | Entity[] | null
+
+  signBook: (slot: number, pages: string[], author: string, title: string) => Promise<void>
 
   wake: () => Promise<void>
 
@@ -607,6 +664,58 @@ export interface Bot extends TypedEmitter<BotEvents> {
   denyResourcePack: () => void
 
   respawn: () => void
+}
+
+/** The payload of the `teleport` event */
+export interface TeleportEvent {
+  /** The packet's teleport id (positions before 1.9 carry none) */
+  id?: number
+  /** Where the packet put the bot (relative flags resolved) */
+  position: Vec3
+  /** Degrees as in the packet, resolved */
+  yaw: number
+  pitch: number
+  /** The packet's relative-axis flags: an object on 1.20.5+, a bitmask before */
+  flags: any
+  /** The bot's velocity after the packet */
+  velocity: Vec3
+  /** True for the first teleport within 10 s of a login, respawn or dimension change */
+  requested: boolean
+}
+
+export interface ActionRejection {
+  /** 'dig', 'place', 'attack', 'use' or 'click' */
+  action: string
+  code: 'too-far' | 'no-sight' | 'moved' | 'gone'
+  detail: string
+}
+
+/** `bot._input.stats` */
+export interface InputStats {
+  /** Ticks the stall guard dropped instead of replaying them (see `maxCatchupTicks`) */
+  droppedTicks: number
+  /** Primary actions that had to wait a tick behind another */
+  deferred: number
+  /** Refused aimed actions by error code */
+  rejected: { [code: string]: number }
+}
+
+/** What the engine keeps on the bot's own entity (1.21+) */
+declare module 'prismarine-entity' {
+  interface Entity {
+    eyeHeight?: number
+    pose?: 'standing' | 'crouching' | 'swimming' | 'gliding'
+    isSwimming?: boolean
+    eyeInWater?: boolean
+    isInWater?: boolean
+    isInLava?: boolean
+    isInWeb?: boolean
+    isCollidedHorizontally?: boolean
+    isCollidedVertically?: boolean
+    /** A graze against a wall that does not stop a sprint */
+    minorHorizontalCollision?: boolean
+    crouching?: boolean
+  }
 }
 
 export interface simpleClick {
@@ -1053,6 +1162,9 @@ export class Particle {
   count: number
   movementSpeed: number
   longDistanceRender: boolean
+  /** 26.3+: the speed per axis (`movementSpeed` is the largest) and how it is randomized */
+  maxSpeed?: Vec3
+  randomizationType?: 'default' | 'alternative' | 'alternative_with_speed'
   static fromNetwork(packet: Object): Particle
 
   constructor(
