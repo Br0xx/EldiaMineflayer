@@ -62,7 +62,7 @@ const container = {
       })
       results.push({ block: block.name, pos: ctx.session.where(pos), status: 'ok', openMs, afterClickMs: click ? Date.now() - click.rec.t - ctx.session.t0 : null, windowType: window.type, items: lines.length, shulkersRead: lines.filter(l => l.contents).length })
       ctx.note(`${label}: ${lines.length} stacks in ${openMs} ms${lines.some(l => l.contents) ? ` (${lines.filter(l => l.contents).length} shulker boxes read)` : ''}`)
-      bot.closeWindow(window)
+      bot.closeWindow(window).catch(() => {})
       await ctx.ticks(4)
       ctx.expect(!bot.currentWindow, `${label}: the window is still open after closing it`)
       await ctx.sleep(1500)

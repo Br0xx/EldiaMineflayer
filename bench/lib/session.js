@@ -43,6 +43,7 @@ class Session extends EventEmitter {
     this.expectEnd = false
     this.generation = 0
     this.lastLoginAt = 0
+    this.logins = [] // when each login of this run started
     this.frame = null
     this.between = new Frame('(between scenarios)', this)
     this.dead = new Promise(() => {})
@@ -64,6 +65,9 @@ class Session extends EventEmitter {
 
   where (v) { return this.shift(v.x, v.y, v.z).map(n => round(n, 2)).join(' ') }
 
+  // Logins made in the last hour: TCPShield (9b9t) starts dropping connections at about 20 an hour from one address
+  loginsLastHour () { return this.logins.filter(t => t > Date.now() - 3_600_000).length }
+
   get alive () { return !!this.bot && !this.ended }
   get f () { return this.frame ?? this.between }
 
@@ -83,6 +87,7 @@ class Session extends EventEmitter {
       await sleep(wait)
     }
     this.lastLoginAt = Date.now()
+    this.logins.push(this.lastLoginAt)
     const gen = ++this.generation
     this.ended = false
     this.expectEnd = false

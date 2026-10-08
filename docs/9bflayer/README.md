@@ -50,7 +50,8 @@ Nothing of this fork itself has run against a live Grim yet.
 - The reach attribute keys on 1.20.5 to 1.21.1 are guessed (minecraft-data is stale there). The fallback is 4.5 for
   blocks and 3.0 for entities.
 - **26.3 has never met a real server.** The data is minecraft-data's unmerged PR #1301 (the `pc_26_3` branch is a copy of
-  26.1). Open: whether a server accepts the `teleport_confirm` with the position and rotation we write, what the new
+  26.1). Open: whether a server accepts the `teleport_confirm` with the position and rotation we write (and whether the real
+  26.3 client sends nothing after it, as the fork now assumes from Grim), what the new
   serverbound `punch` packet is for (no fields; the fork keeps swinging with `arm_animation`), and the inherited
   particle/sound/biome/attribute data ([v26_3.md](research/v26_3.md)).
 - The window type ids are prismarine-windows' list (the 1.20.3 menu registry). The join packets carry no menu registry to

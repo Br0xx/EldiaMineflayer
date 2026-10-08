@@ -505,7 +505,7 @@ This function returns a `Promise`, with `void` as its argument when done withdra
 
 #### window.close()
 
-Close the `window`; returns the `Promise` from [bot.closeWindow(window)](#botclosewindowwindow).
+Close the `window`; returns the `Promise` from [bot.closeWindow(window)](#botclosewindowwindow), which can reject. Not awaiting it is safe: it never raises an unhandled rejection.
 
 ### Recipe
 
@@ -888,14 +888,16 @@ pb.run(async bot => { /* rejects with code 'disconnected' if the bot ends */ }).
    - maxAttempts : 0, consecutive failed attempts before giving up (0 = never)
    - loginBudget : `{ perHour: 6, perHostPerHour: 20, minSpacingMs, windowMs: 3600000 }`. `perHour` counts the logins of this bot (0 = unlimited). `perHostPerHour` counts the logins to one host:port from every PersistentBot in the process, because TCPShield counts per IP (0 = unlimited). `minSpacingMs` defaults to 15000 for `auth: 'microsoft'` and 0 otherwise, and is shared by every PersistentBot in the process: one scheduler, because Xbox rate-limits per IP and account.
    - store : `{ load(), save(state) }` keeping the login timestamps (`{ logins: number[] }`) across process restarts, so a crash loop cannot spend the budget again. Default in memory; `mineflayer.fileStore(path, { key })` keeps them in a JSON file that several bots can share (one `key` each). The state is `{ logins, hosts: { 'host:port': timestamps } }`, so the host budget survives restarts too. Both calls are synchronous.
-   - loginTimeoutMs : 180000, how long a connection may take to spawn (sign-in time not counted: the clock starts after the Microsoft code is entered). The 9b9t queue can hold a login for minutes. A bot that hangs is ended and counts as a hung login, not as a kick.
-   - hungLoginLimit : 3, hung logins in a row after which it stops trying: every further attempt keeps the IP throttled. 0 = never. A spawn resets the count.
+   - loginTimeoutMs : 180000, how long a connection may take to reach the play-state `login` packet (sign-in time not counted: the clock starts after the Microsoft code is entered). A connection that gets no further is "hung": that is what a throttled IP looks like (TCPShield opens the connection and never answers). It is ended and counts as a hung login, not as a kick. A connection that has logged in is never hung, however long the 9b9t queue holds it.
+   - spawnTimeoutMs : 1200000 (20 min), how long a logged-in connection may wait for its first `spawn` (the first `update_health`, which a queue may delay). 0 = no limit. It reconnects with the backoff (cause `'spawn-timeout'`, end reason `'spawnTimeout'`) and does not count as a hung login.
+   - hungLoginLimit : 3, hung logins in a row after which it stops trying: every further attempt keeps the IP throttled. 0 = never. A `login` resets the count.
    - hungLoginResumeMs : 3600000, after that stop, one new try this long later (state 'waiting', 'waiting' event with reason `'throttled'`). If that one hangs too it waits again, so it makes one try per hour instead of three in a row. `pb.stop()` ends it for good. 0 = stop for good with cause `'throttled'` ('stopped' is emitted).
    - stableMs : 60000, how long a connection must stay up for the backoff to start over (a login that is kicked a second later does not reset it)
    - longWaitMs : 300000, the hold-off for 'wait' decisions
    - conflictLimit : 3, "already connected" kicks in a row before it assumes another session owns the account and stops
+   - sessionErrorLimit : 3, "invalid session" / "failed to verify username" kicks in a row before it stops (cause `'session'`). Each waits `longWaitMs` first: Mojang's session server is down for minutes now and then, and that is not the account's fault.
    - transferDelayMs : 500, pause before following a transfer packet
-   - giveUpOn : list of strings (substring, case-insensitive) and RegExps, added to the built-in list (banned, not whitelisted, invalid session, account does not own Minecraft, outdated client), for kick texts that mean stop
+   - giveUpOn : list of strings (substring, case-insensitive) and RegExps, added to the built-in list (banned, not whitelisted, invalid credentials, account does not own Minecraft, outdated client), for kick texts that mean stop
    - classify : `(reasonText, info) => 'retry' | 'wait' | 'stop' | undefined`, called first; anything else falls through to the built-in rules. `info` is `{ kicked, error, wasOnline, onlineMs, hung }`.
 
 #### Events
@@ -908,7 +910,7 @@ pb.run(async bot => { /* rejects with code 'disconnected' if the bot ends */ }).
  * 'transfer' ({ host, port }) : the server sent a transfer packet (1.20.5+). The keeper ends the connection and logs in to the target after `transferDelayMs`. This is a new TCP connection but not a new login: it is not counted in the budget, and three in a minute are treated as a redirect loop and wait `longWaitMs`. The next connection after the transferred one goes back to the configured host.
  * 'msaCode' (data) : the Microsoft device-code prompt
  * 'state' (state, previous)
- * 'stopped' (reason, cause) : it will not log in again. `cause` is one of 'user' (the code called `bot.end()`/`bot.quit()`), 'stopped' (`pb.stop()`), 'give-up' (`giveUpOn`), 'classify', 'throttled' (only with `hungLoginResumeMs: 0`), 'conflict', 'max-attempts', 'reconnect-disabled'.
+ * 'stopped' (reason, cause) : it will not log in again. `cause` is one of 'user' (the code called `bot.end()`/`bot.quit()`), 'stopped' (`pb.stop()`), 'give-up' (`giveUpOn`), 'classify', 'throttled' (only with `hungLoginResumeMs: 0`), 'conflict', 'session', 'config' (`createBot` threw: an unsupported version or a bad option, which waiting does not fix; no login is spent), 'max-attempts', 'reconnect-disabled'.
  * 'error' (err) : errors of the inner bots. It is only emitted when there is a listener, so nothing crashes the process.
 
 #### Methods and properties
@@ -926,15 +928,18 @@ pb.run(async bot => { /* rejects with code 'disconnected' if the bot ends */ }).
 | Disconnect | Decision |
 |---|---|
 | `bot.end()` / `bot.quit()` by your code | stop (`'user'`) |
-| banned, not whitelisted, invalid session, does not own the game, outdated client, `giveUpOn` | stop (`'give-up'`) |
+| banned, not whitelisted, does not own the game, outdated client, `giveUpOn` | stop (`'give-up'`) |
+| `createBot` throws (unsupported version, bad option) | stop (`'config'`), no login spent |
 | "already connected" and the like | wait `longWaitMs`; stop after `conflictLimit` in a row |
+| "invalid session", "failed to verify username" | wait `longWaitMs`; stop after `sessionErrorLimit` in a row |
 | server restarting or closed | wait `longWaitMs` |
 | HTTP 429 | wait `longWaitMs`, and no Microsoft login in this process starts before that |
 | full, queue, throttled, `ETIMEDOUT`, `ECONNRESET`, watchdog, any other kick | retry with the backoff |
-| no spawn within `loginTimeoutMs` | retry with the backoff; `hungLoginLimit` in a row wait `hungLoginResumeMs` for one more try (or stop, if that is 0) |
+| no play-state `login` within `loginTimeoutMs` (hung) | retry with the backoff; `hungLoginLimit` in a row wait `hungLoginResumeMs` for one more try (or stop, if that is 0) |
+| logged in but no `spawn` within `spawnTimeoutMs` | retry with the backoff; not counted as hung |
 | transfer | follow it after `transferDelayMs` |
 
-Whatever the decision, a login only starts when both budgets have room; otherwise 'waiting' tells you when the next slot opens. A restart that finds the budget spent (the store remembers) waits instead of logging in.
+Whatever the decision, a login only starts when both budgets have room; otherwise 'waiting' tells you when the next slot opens. The slot is taken when the attempt begins and the budgets are looked at again after the wait for the Microsoft scheduler, so bots started in the same turn cannot spend one slot together. A restart that finds the budget spent (the store remembers) waits instead of logging in.
 
 ### Properties
 
@@ -1403,6 +1408,10 @@ before doing anything on the server.
 Emitted when you change dimensions and just before you spawn.
 Usually you want to ignore this event and wait until the "spawn"
 event instead.
+
+The listener gets `{ keepTrackedData }`: whether the respawn packet keeps the player's tracked data (the sprint and
+sneak flags) on the new player, as for a dimension change; a death does not. The physics keep the sprint state when it
+is true.
 
 #### "game"
 
@@ -2425,7 +2434,7 @@ Put the item at `slot` in the inventory.
 
 This function returns a `Promise`, with `void` as its argument once the server has acknowledged the close.
 
-Close the `window`. On 1.16.5 and below the server only learns which inventory slots the window changed on its next tick, so await this before anything else (a command, another player) touches those slots.
+Close the `window`. The promise rejects when the bot ended, or when a movement key stays held for 40 ticks (the close waits for the keys to be released); await it or add a `.catch`, and note that a close you do not await must not leak that rejection ([window.close()](#windowclose) and the library's own fire-and-forget closes catch it). On 1.16.5 and below the server only learns which inventory slots the window changed on its next tick, so await this before anything else (a command, another player) touches those slots.
 
 #### bot.transfer(options)
 

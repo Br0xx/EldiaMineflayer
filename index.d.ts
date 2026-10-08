@@ -217,7 +217,8 @@ export interface BotEvents {
   login: () => Promise<void> | void
   /** When `respawn` option is disabled, you can call this method manually to respawn. */
   spawn: () => Promise<void> | void
-  respawn: () => Promise<void> | void
+  /** `keepTrackedData`: the packet keeps the sprint and sneak flags (a dimension change; a death does not) */
+  respawn: (info?: { keepTrackedData: boolean }) => Promise<void> | void
   /** A totem of undying popped (entity_status 35 for the bot) */
   totemUsed: () => Promise<void> | void
   /**
@@ -1241,9 +1242,17 @@ export interface ReconnectOptions {
   maxAttempts?: number
   loginBudget?: LoginBudget
   store?: LoginStore
-  /** Milliseconds from the attempt to the first spawn before the connection is dropped and counted as hung @default 180000 */
+  /**
+   * Milliseconds from the attempt to the play-state `login` packet before the connection is dropped and counted as
+   * hung (what a throttled IP looks like). A logged-in connection is never hung. @default 180000
+   */
   loginTimeoutMs?: number
-  /** Hung logins in a row after which the keeper stops (the IP is probably throttled); 0 = never @default 3 */
+  /**
+   * Milliseconds a logged-in connection may wait for its first `spawn` (a queue): then it reconnects with the backoff,
+   * not counted as hung. 0 = no limit. @default 1200000
+   */
+  spawnTimeoutMs?: number
+  /** Hung logins (no `login` within loginTimeoutMs) in a row after which the keeper stops (the IP is probably throttled); 0 = never @default 3 */
   hungLoginLimit?: number
   /**
    * After that stop, one new try this long later (and again each time it hangs) instead of stopping for good;
@@ -1256,9 +1265,11 @@ export interface ReconnectOptions {
   longWaitMs?: number
   /** 'already connected' kicks in a row before assuming another session owns the account @default 3 */
   conflictLimit?: number
+  /** 'invalid session' / 'failed to verify username' kicks in a row before stopping with cause 'session'; each waits longWaitMs @default 3 */
+  sessionErrorLimit?: number
   /** Pause before following a transfer packet @default 500 */
   transferDelayMs?: number
-  /** Added to the built-in list (bans, whitelist, invalid session, outdated client…): kick texts that mean stop */
+  /** Added to the built-in list (bans, whitelist, invalid credentials, outdated client…): kick texts that mean stop */
   giveUpOn?: Array<string | RegExp>
   /** Decide for a disconnect text; return nothing to use the built-in rules */
   classify?: (reason: string, info: { kicked: boolean, error: Error | null, wasOnline: boolean, onlineMs: number, hung: boolean }) => ReconnectVerdict | void | undefined
@@ -1272,14 +1283,14 @@ export interface PersistentBotOptions extends Omit<BotOptions, 'client'> {
 
 export interface ReconnectDecision {
   action: ReconnectVerdict
-  /** Why: 'user', 'stopped', 'give-up', 'classify', 'throttled', 'conflict', 'max-attempts', 'transfer', 'rate-limit', 'server-restart', 'hung-login', 'watchdog', 'kicked', 'network'… */
+  /** Why: 'user', 'stopped', 'give-up', 'classify', 'throttled', 'conflict', 'session', 'config', 'max-attempts', 'transfer', 'rate-limit', 'server-restart', 'hung-login', 'spawn-timeout', 'watchdog', 'kicked', 'network'… */
   cause: string
   delayMs: number
   /** When the next login starts (`Date.now()` scale); null when stopped */
   at: number | null
   /** 'budget' or 'hostBudget' if a login budget, not the backoff, sets the time */
   blockedBy?: 'budget' | 'hostBudget' | null
-  /** What the client reported ('socketClosed', 'watchdog', 'loginTimeout'…) */
+  /** What the client reported ('socketClosed', 'watchdog', 'loginTimeout', 'spawnTimeout', 'config'…) */
   endReason?: string
   message?: string
 }

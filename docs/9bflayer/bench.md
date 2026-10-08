@@ -35,6 +35,7 @@ needs from the world.
 | `--timeout T`, `--login-timeout T` | 120s, 120s | per scenario, and for a login (raise it for the 9b9t queue) |
 | `--spacing T` | 15s microsoft, 2s offline | minimum time between two logins |
 | `--max-containers N` | 6 | how many containers `container` opens |
+| `--max-logins N` | 6 | logins per hour (all scenarios) before the soak stops with "stopped: login budget" instead of reviving after another kick; 0 = no limit |
 | `--json FILE` | | also write the report there (it is always in the output folder) |
 | `--out DIR` | `bench/out/<timestamp>` | traces and `report.json` |
 | `--pathfinder-from DIR` | the working directory | where `pathfinder` finds mineflayer-pathfinder |

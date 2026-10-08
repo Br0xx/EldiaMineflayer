@@ -17,6 +17,7 @@ const DEFAULTS = {
   loginTimeout: 120000,
   spacing: null, // between logins; null: 15 s for microsoft, 2 s otherwise
   maxContainers: 6,
+  maxLogins: 6, // per hour, the soak stops rather than log in more often (the keeper's per-bot default)
   out: null,
   profiles: null,
   pathfinderFrom: null,
@@ -51,6 +52,7 @@ function parseArgs (argv) {
   opts.port = Number(opts.port)
   opts.radius = Number(opts.radius)
   opts.maxContainers = Number(opts.maxContainers)
+  opts.maxLogins = Number(opts.maxLogins)
   for (const k of ['duration', 'idle', 'timeout', 'loginTimeout']) if (typeof opts[k] === 'string') opts[k] = parseDuration(opts[k])
   if (opts.spacing !== null) opts.spacing = parseDuration(opts.spacing)
   if (!['offline', 'microsoft'].includes(opts.auth)) throw new Error('--auth must be offline or microsoft')
@@ -71,6 +73,7 @@ const USAGE = `usage: node bench/run.js --host H --port P --version V --auth off
   --login-timeout T   limit for a login, microsoft device code and 9b9t queue included (default 120s)
   --spacing T         minimum time between two logins (default 15s for microsoft, 2s otherwise)
   --max-containers N  containers the container scenario opens (default 6)
+  --max-logins N      logins per hour the soak may make before it stops (default 6; 0 = no limit)
   --json FILE         also write the report to FILE
   --out DIR           where traces go (default bench/out/<timestamp>)
   --profiles DIR      microsoft token cache (default bench/.auth)

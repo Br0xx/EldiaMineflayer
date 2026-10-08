@@ -133,6 +133,28 @@ describe('bench against the mock server: what it reports when something is wrong
   })
 })
 
+describe('bench against the mock server: the soak login budget', function () {
+  this.timeout(60 * 1000)
+  it('stops with "login budget" instead of logging in after every kick', async () => {
+    const mock = await startMock({ version: '1.21.4' })
+    let kicker
+    try {
+      const report = await runBench(options(mock, '1.21.4', ['--scenarios', 'soak', '--duration', '50s', '--spacing', '100ms', '--max-logins', '3']), {
+        onStart: () => { kicker = setInterval(() => mock.kick('lag'), 900) }
+      })
+      const soak = report.scenarios[0]
+      assert.strictEqual(soak.status, 'fail')
+      assert.strictEqual(soak.metrics.stopped, 'login budget')
+      assert.strictEqual(soak.metrics.relogins, 2, 'three logins in all: the first and two revivals')
+      assert.ok(soak.reasons.some(r => /stopped: login budget \(3 logins/.test(r)), JSON.stringify(soak.reasons))
+      assert.ok(soak.durationMs < 30000, 'it stopped long before the duration')
+    } finally {
+      clearInterval(kicker)
+      mock.close()
+    }
+  })
+})
+
 describe('bench against the mock server: the world features', function () {
   this.timeout(180 * 1000)
   const version = '1.21.4'

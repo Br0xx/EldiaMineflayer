@@ -70,6 +70,9 @@ for (const supportedVersion of mineflayer.testedVersions) {
     let bot
     let server
     let PORT
+    // The packet that answers a teleport: the confirm itself on 26.3+ (it carries the position), else the position_look
+    const positionalConfirm = () => !!bot.registry.protocol.play.toServer.types.packet_teleport_confirm?.[1]?.some(f => f.name === 'yRot')
+    const answerName = () => positionalConfirm() ? 'teleport_confirm' : 'position_look'
     beforeEach(async function () {
       PORT = await getPort()
       server = mc.createServer({
@@ -483,7 +486,9 @@ for (const supportedVersion of mineflayer.testedVersions) {
           done()
         })
       })
-      it('answers only the latest teleport when a second one lands inside the respawn reply delay', (done) => {
+      it('answers only the latest teleport when a second one lands inside the respawn reply delay', function (done) {
+        // 26.3+: the confirm is the answer and always goes out at once; the delay is for servers before 1.19
+        if (positionalConfirm()) return this.skip()
         // After a death the reply to the next teleport waits 1.5 s. A teleport that arrives inside
         // that window replaces it: the deferred reply must not go out with the older coordinates.
         const teleport = (teleportId, x, y, z) => ({
@@ -2321,8 +2326,8 @@ for (const supportedVersion of mineflayer.testedVersions) {
           1: { block: 'barrel', window: 'minecraft:generic_9x3' },
           2: { block: 'red_shulker_box', window: 'minecraft:shulker_box' },
           3: { block: 'chest', window: 'minecraft:generic_9x3' },
-          4: { block: 'chest', window: 'minecraft:generic_9x6', props: { facing: 'south', type: 'left', waterlogged: false } },
-          5: { block: 'chest', window: 'minecraft:generic_9x6', props: { facing: 'south', type: 'right', waterlogged: false } },
+          4: { block: 'chest', window: 'minecraft:generic_9x6', props: { facing: 'south', type: 'right', waterlogged: false } },
+          5: { block: 'chest', window: 'minecraft:generic_9x6', props: { facing: 'south', type: 'left', waterlogged: false } },
           6: { block: 'dropper', window: 'minecraft:generic_3x3', props: { facing: 'north', triggered: false } },
           8: { block: 'ender_chest', window: 'minecraft:generic_9x3' }
         }
@@ -3254,7 +3259,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
               bot._client.emit('position', { ...teleport, y: 90, teleportId: 1 })
               assert.deepStrictEqual(writes, [], 'the teleport must not be answered from inside the packet handler')
               await once(bot, 'forcedMove')
-              assert.ok(writes.includes('position_look'), 'the teleport is answered on the next tick')
+              assert.ok(writes.includes(answerName()), 'the teleport is answered on the next tick')
             } finally {
               bot._client.write = write
             }
@@ -3307,7 +3312,9 @@ for (const supportedVersion of mineflayer.testedVersions) {
               const replies = writes
                 .filter(w => ['pong', 'teleport_confirm', 'position_look'].includes(w.name))
                 .map(w => (w.name === 'pong' ? `pong ${w.params.id}` : w.name))
-              assert.deepStrictEqual(replies, ['pong 1', 'teleport_confirm', 'position_look', 'pong 2'])
+              // 26.3+: the confirm carries the position and nothing follows it
+              const reply = positionalConfirm() ? [] : ['position_look']
+              assert.deepStrictEqual(replies, ['pong 1', 'teleport_confirm', ...reply, 'pong 2'])
             } finally {
               bot._client.write = write
             }
@@ -3344,7 +3351,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
             const replies = []
             const write = bot._client.write.bind(bot._client)
             bot._client.write = (name, params) => {
-              if (name === 'position_look') replies.push(params.y)
+              if (name === answerName()) replies.push(params.y)
               return write(name, params)
             }
             try {
@@ -3390,7 +3397,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
             const replies = []
             const write = bot._client.write.bind(bot._client)
             bot._client.write = (name, params) => {
-              if (name === 'position_look') replies.push(params.yaw)
+              if (name === answerName()) replies.push(params.yaw ?? params.yRot)
               return write(name, params)
             }
             try {
@@ -3399,7 +3406,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
               bot._client.emit('position', { ...teleport, yaw: 30, teleportId: 1 })
               bot._client.emit('player_rotation', { yaw: 90, pitch: 0 })
               await once(bot, 'forcedMove')
-              // the first position_look is the answer, the tick's own movement packet may follow it with the newer rotation
+              // the first answer is the teleport's, the tick's own movement packet may follow it with the newer rotation
               assert.strictEqual(replies[0], 30, 'the teleport is answered with its own rotation')
               assert.strictEqual(bot.entity.yaw, require('../lib/conversions').fromNotchianYaw(90), 'the later rotation wins')
             } finally {
@@ -4049,7 +4056,14 @@ for (const supportedVersion of mineflayer.testedVersions) {
         await ticksOf(3)
         assert.strictEqual(bot.entity.onGround, false)
         received.length = 0
+        const flew = []
+        bot.once('entityElytraFlew', (entity) => flew.push(entity))
+        assert.ok(!bot.entity.elytraFlying)
         await bot.elytraFly()
+        // the start tick is already a glide (Grim sets isGliding on the packet), without waiting for the metadata
+        assert.strictEqual(bot.entity.elytraFlying, true, 'glides in the tick of the start')
+        assert.strictEqual(bot.entity.pose, 'gliding')
+        assert.deepStrictEqual(flew, [bot.entity], 'entityElytraFlew is emitted once, by the local start')
         await ticksOf(3)
         const t = timeline().filter(p => ['entity_action', 'player_input'].includes(p.name))
         const names = t.map(p => p.name === 'entity_action' ? p.data.actionId : `input:${p.data.inputs.jump}`)
@@ -4137,18 +4151,79 @@ for (const supportedVersion of mineflayer.testedVersions) {
         assert.ok(clickOrder.indexOf('player_input') < clickOrder.indexOf('window_click') || !clickOrder.includes('window_click'))
       })
 
+      // A close that cannot finish (a key is held for 40 ticks) rejects its promise; callers that fire and forget must
+      // not turn that into an unhandledRejection, which ends the process
+      async function withRejectionWatch (body) {
+        const rejections = []
+        const onRejection = (err) => rejections.push(err)
+        const listeners = process.listeners('unhandledRejection')
+        process.removeAllListeners('unhandledRejection')
+        process.on('unhandledRejection', onRejection)
+        try {
+          await body()
+          await sleep(50)
+        } finally {
+          process.off('unhandledRejection', onRejection)
+          for (const listener of listeners) process.on('unhandledRejection', listener)
+          bot.clearControlStates()
+        }
+        assert.deepStrictEqual(rejections.map(e => e.message), [])
+      }
+      const serveWindow = () => {
+        const pWindows = require('prismarine-windows')(supportedVersion)
+        const chestData = pWindows.windows['minecraft:generic_9x3'] ?? { type: 'minecraft:chest', slots: 63 }
+        return () => {
+          client.write('open_window', { windowId: 1, inventoryType: chestData.type, windowTitle: chatText(''), slotCount: chestData.slots - 36, entityId: 0 })
+          client.write('window_items', { windowId: 1, stateId: 1, items: Array.from({ length: chestData.slots }, () => Item.toNotch(null)), carriedItem: Item.toNotch(null) })
+        }
+      }
+
+      flow('a window that opens late while the bot walks is closed without an unhandled rejection', async () => {
+        const open = serveWindow()
+        await withRejectionWatch(async () => {
+          await assert.rejects(bot.vanilla.openContainer(bot.blockAt(chestPos), { openTimeoutMs: 150, containerSpacingMs: 0 }), err => err.code === 'timeout')
+          bot.setControlState('forward', true)
+          await bot.waitForTicks(2)
+          open() // the window the server sat on arrives: the late close waits for the keys for 40 ticks, then rejects
+          await bot.waitForTicks(46)
+        })
+      })
+
+      flow('window.close() without await does not leak the rejection when the keys stay held', async () => {
+        const open = serveWindow()
+        client.on('packet', (data, meta) => { if (meta.name === 'block_place') open() })
+        const window = await bot.vanilla.openContainer(bot.blockAt(chestPos))
+        await withRejectionWatch(async () => {
+          bot.setControlState('forward', true)
+          await bot.waitForTicks(2)
+          const closing = window.close() // nobody awaits it, as in every upstream example
+          await bot.waitForTicks(46)
+          await assert.rejects(closing, /movement keys are still held/) // an awaiting caller still sees it
+        })
+      })
+
       flow('a teleport and a server rotation are answered like the vanilla client does', async () => {
         const teleport = { x: 3.5, y: 65, z: 4.5, dx: 0, dy: 0, dz: 0, yaw: 30, pitch: 5, flags: bot.registry.version['>=']('1.21.3') ? {} : 0, teleportId: 1 }
         received.length = 0
         client.write('position', teleport)
         await once(bot, 'forcedMove')
         await bot.waitForTicks(2)
-        const reply = received.find(p => p.name === 'position_look')
-        assert.ok(reply)
-        assert.strictEqual(reply.data.x, 3.5)
-        assert.strictEqual(reply.data.yaw, 30)
         const confirm = names(received).indexOf('teleport_confirm')
-        assert.ok(confirm >= 0 && confirm < names(received).indexOf('position_look'))
+        assert.ok(confirm >= 0)
+        if (positionalConfirm()) {
+          // 26.3+: the confirm is the whole answer. A PosRot behind it would be read as a move from a standstill in the air.
+          const c = received[confirm].data
+          assert.deepStrictEqual([c.x, c.y, c.z, c.yRot, c.xRot], [3.5, 65, 4.5, 30, 5])
+          const tickEnd = names(received).indexOf('tick_end', confirm)
+          const moves = received.slice(confirm + 1, tickEnd).filter(p => ['position', 'position_look', 'look', 'flying'].includes(p.name))
+          assert.deepStrictEqual(moves.map(p => p.name), ['position_look'], 'only the tick\'s own movement follows, no extra reply')
+        } else {
+          const reply = received.find(p => p.name === 'position_look')
+          assert.ok(reply)
+          assert.strictEqual(reply.data.x, 3.5)
+          assert.strictEqual(reply.data.yaw, 30)
+          assert.ok(confirm < names(received).indexOf('position_look'))
+        }
         // the bot kept the ground it stands on: the next steps use ground acceleration (keep-ground)
         assert.strictEqual(bot.entity.onGround, true)
         if (!hasRotationPacket) return
@@ -4181,6 +4256,32 @@ for (const supportedVersion of mineflayer.testedVersions) {
         bot.clearControlStates()
         await bot.waitForTicks(2)
       })
+
+      for (const [kept, copyMetadata] of [[true, 2], [true, 3], [false, 0], [false, 1]]) {
+        flow(`a respawn packet with data kept = ${copyMetadata} ${kept ? 'keeps' : 'forgets'} the sprint`, async () => {
+          bot.food = 20
+          bot.setControlState('forward', true)
+          bot.setControlState('sprint', true)
+          await bot.waitForTicks(3)
+          assert.strictEqual(bot.sprinting, true)
+          const login = bot.test.generateLoginPacket()
+          received.length = 0
+          const respawned = once(bot, 'respawn')
+          client.write('respawn', { worldState: { ...login.worldState }, copyMetadata })
+          const [info] = await respawned
+          assert.strictEqual(info.keepTrackedData, kept)
+          client.write('position', { x: 1.5, y: 65, z: 4.5, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: bot.registry.version['>=']('1.21.3') ? {} : 0, teleportId: 7 })
+          await once(bot, 'forcedMove')
+          await bot.waitForTicks(3)
+          const actions = () => received.filter(p => ['player_input', 'entity_action'].includes(p.name)).map(p => p.name === 'entity_action' ? p.data.actionId : 'player_input')
+          // the keys go out again for the new player; a kept sprint is already known to the server
+          assert.deepStrictEqual(actions(), kept ? ['player_input'] : ['player_input', 'start_sprinting'])
+          received.length = 0
+          bot.clearControlStates()
+          await bot.waitForTicks(3)
+          assert.deepStrictEqual(actions(), ['player_input', 'stop_sprinting'])
+        })
+      }
 
       flow('looking: the pitch stays within +-90 degrees, the yaw takes the short way, a forced look does not jump', async () => {
         await assert.rejects(bot.look(NaN, 0), /finite/)

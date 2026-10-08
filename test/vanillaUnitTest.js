@@ -410,4 +410,51 @@ describe('9bflayer connection guards', function () {
       })
     }
   })
+
+  describe('scanContainers', () => {
+    // Direction.getClockWise() of a facing: the side where a left half has its partner (ChestBlock.getConnectedDirection)
+    const clockwise = { north: [1, 0], east: [0, 1], south: [-1, 0], west: [0, -1] }
+
+    for (const facing of Object.keys(clockwise)) {
+      it(`pairs the double chests of a row facing ${facing} left-right, left-right: two entries, each opened once`, async () => {
+        const [dx, dz] = clockwise[facing]
+        const types = ['left', 'right', 'left', 'right']
+        const at = (i) => vec3(10 + i * dx, 0, 10 + i * dz)
+        const bot = new EventEmitter()
+        bot.registry = require('prismarine-registry')('1.21.4')
+        bot.blockAt = (p) => {
+          const i = types.findIndex((t, k) => at(k).equals(p))
+          return i < 0 ? { name: 'air', position: p.clone() } : { name: 'chest', position: p.clone(), getProperties: () => ({ facing, type: types[i] }) }
+        }
+        bot.findBlocks = () => types.map((t, i) => at(i))
+        bot.entity = { position: at(-1) }
+        const opened = []
+        bot.vanilla = {
+          openContainer: async (block) => { opened.push(block.position); return { type: 'minecraft:generic_9x6', containerItems: () => [] } },
+          closeAnyWindow: async () => {}
+        }
+        require('../lib/plugins/containers.js')(bot)
+        const index = await bot.vanilla.scanContainers(8, { settleMs: 0 })
+        assert.strictEqual(index.length, 2)
+        assert.strictEqual(opened.length, 2, 'no window is read twice')
+        // each entry names the other half of its own pair: the nearer half is opened
+        assert.ok(index[0].position.equals(at(0)) && index[0].double.equals(at(1)), `${index[0].position} + ${index[0].double}`)
+        assert.ok(index[1].position.equals(at(2)) && index[1].double.equals(at(3)), `${index[1].position} + ${index[1].double}`)
+      })
+    }
+
+    it('leaves a half whose partner side holds something else as it is, and a pair facing another way', async () => {
+      // left at x = 0 facing north has its partner at x = 1; a right half facing south there is not its partner
+      const blocks = { 0: { facing: 'north', type: 'left' }, 1: { facing: 'south', type: 'right' }, 5: { facing: 'north', type: 'right' } }
+      const bot = new EventEmitter()
+      bot.registry = require('prismarine-registry')('1.21.4')
+      bot.blockAt = (p) => (p.y === 0 && p.z === 0 && blocks[p.x]) ? { name: 'chest', position: p.clone(), getProperties: () => blocks[p.x] } : { name: 'air', position: p.clone() }
+      bot.findBlocks = () => [0, 1, 5].map(x => vec3(x, 0, 0))
+      bot.entity = { position: vec3(-1, 0, 0) }
+      bot.vanilla = { openContainer: async () => ({ type: 'minecraft:generic_9x3', containerItems: () => [] }), closeAnyWindow: async () => {} }
+      require('../lib/plugins/containers.js')(bot)
+      const index = await bot.vanilla.scanContainers(8, { settleMs: 0 })
+      assert.deepStrictEqual(index.map(e => [e.position.x, e.double?.x]), [[0, undefined], [1, undefined], [5, undefined]])
+    })
+  })
 })

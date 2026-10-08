@@ -110,12 +110,14 @@ and come back when it drops, without getting its IP throttled. 9b9t sits behind 
 starts dropping connections with `read ETIMEDOUT` and lets new logins hang, and Xbox answers 429 to Microsoft logins
 closer than ~15 s. So:
 
-- reconnects back off from 10 s to 5 min, with jitter, and the kick decides: a ban, an invalid session or a `bot.end()` of
-  yours stops it, "already connected" and server restarts wait 5 min, a full server or a queue retries;
+- reconnects back off from 10 s to 5 min, with jitter, and the kick decides: a ban or a `bot.end()` of yours stops it,
+  "already connected", "failed to verify username" (a session-server outage) and server restarts wait 5 min (the first two
+  stop after 3 in a row), a full server or a queue retries; options `createBot` rejects stop it at once;
 - every login goes through a budget of 6 an hour per bot and 20 an hour per host for the whole process (kept in a file
   store, so a crash loop that restarts the process cannot spend them again) and, for Microsoft accounts, a single scheduler for the whole process that keeps logins 15 s apart;
-- a login that never spawns within 3 min is dropped, and three such hangs in a row stop it (the IP is probably
-  throttled) for an hour, then it tries once;
+- a connection that gets no play-state `login` within 3 min is dropped (that is what a throttled IP looks like), and
+  three such hangs in a row stop it for an hour, then it tries once. A logged-in connection waits for its spawn as long
+  as the queue takes (`spawnTimeoutMs`, 20 min) and is never counted as hung;
 - the watchdog (`watchdog` option, on in `createBot` too) ends a connection that went silent for 90 s, which a dead TCP
   connection never reports by itself;
 - a `transfer` packet is followed without spending a login;

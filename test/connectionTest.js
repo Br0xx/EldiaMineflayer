@@ -338,7 +338,7 @@ describe('9bflayer connection', function () {
     const [message, cause] = await once(pb, 'stopped')
     await sleep(300)
     assert.strictEqual(cause, 'throttled')
-    assert.match(message, /3 logins in a row never spawned.*probably throttled/)
+    assert.match(message, /3 logins in a row never reached the play state.*probably throttled/)
     assert.strictEqual(server.joins.length, 3, 'no fourth attempt')
     assert.strictEqual(pb.stats.hungLogins, 3)
     assert.strictEqual(pb.stats.kicks, 0, 'a hang is not a kick')
@@ -593,6 +593,108 @@ describe('9bflayer connection', function () {
     assert.strictEqual(decision.action, 'wait')
     assert.ok(decision.delayMs >= 5000)
     assert.ok(scheduler.nextAt > Date.now() + 4000)
+  })
+
+  it('bots started in the same turn cannot spend one remaining host slot together', async () => {
+    const server = await serve((client) => spawnClient(client))
+    const ledger = Array.from({ length: 19 }, (_, i) => Date.now() - 1000 * (i + 1))
+    hostLedger.set(`127.0.0.1:${server.port}`, ledger)
+    const budget = { perHour: 100, perHostPerHour: 20, minSpacingMs: 0 }
+    const pbs = ['a', 'b', 'c'].map(username => track(persistent(server, { username }, { loginBudget: budget })))
+    await until(() => pbs.some(pb => pb.state === 'online') && pbs.filter(pb => pb.state === 'waiting').length === 2)
+    await sleep(150)
+    assert.strictEqual(server.joins.length, 1, 'one slot, one login')
+    assert.strictEqual(hostLedger.get(`127.0.0.1:${server.port}`).length, 20)
+    assert.strictEqual(pbs.filter(pb => pb.state === 'waiting').length, 2)
+  })
+
+  it('looks at the budget again after the wait for the login slot', async () => {
+    const server = await serve((client) => spawnClient(client))
+    const key = `127.0.0.1:${server.port}`
+    hostLedger.set(key, Array.from({ length: 18 }, (_, i) => Date.now() - 1000 * (i + 1)))
+    const budget = { perHour: 100, perHostPerHour: 20, minSpacingMs: 400 }
+    const a = track(persistent(server, { username: 'first' }, { loginBudget: budget }))
+    const b = track(persistent(server, { username: 'second' }, { loginBudget: budget }))
+    await until(() => server.joins.length === 1)
+    // another process of the same host spends the last slot while the second bot is queued
+    hostLedger.set(key, [...hostLedger.get(key), Date.now()])
+    const [info] = await once(b, 'waiting')
+    assert.strictEqual(info.reason, 'hostBudget')
+    await sleep(300)
+    assert.strictEqual(server.joins.length, 1, 'the queued bot did not log in')
+    assert.strictEqual(a.state, 'online')
+    assert.strictEqual(b.stats.attempts, 0)
+    assert.strictEqual(hostLedger.get(key).length, 20, 'its reserved slot was given back')
+
+    // the same for the own budget of one bot
+    const server2 = await serve((client) => spawnClient(client))
+    scheduler.penalize(300)
+    const solo = track(persistent(server2, { username: 'solo' }, { loginBudget: { perHour: 1, minSpacingMs: 100 } }))
+    await sleep(50)
+    solo._noteLogin() // another instance sharing the store logs in meanwhile
+    const [soloInfo] = await once(solo, 'waiting')
+    assert.strictEqual(soloInfo.reason, 'budget')
+    assert.strictEqual(server2.joins.length, 0)
+    assert.strictEqual(solo._recentLogins().length, 1, 'only the foreign login is left')
+  })
+
+  it("'Failed to verify username' waits like a conflict and stops only after sessionErrorLimit in a row", async () => {
+    const server = await serve((client) => kick(client, 'Failed to verify username!'))
+    const pb = track(persistent(server, {}, { longWaitMs: 100, sessionErrorLimit: 2 }))
+    const [, cause] = await once(pb, 'stopped')
+    assert.strictEqual(cause, 'session')
+    assert.strictEqual(server.joins.length, 3, 'two waits, then the third one stops')
+    const waits = pb.events.filter(e => e[0] === 'reconnecting')
+    assert.strictEqual(waits.length, 2)
+    assert.ok(waits.every(e => e[1].delayMs >= 100 && e[1].reason === 'session'))
+
+    // an outage that ends: the bot is back, and the count starts again
+    const server2 = await serve((client, n) => { if (n <= 2) return kick(client, 'multiplayer.disconnect.unverified_username'); spawnClient(client) })
+    const back = track(persistent(server2, { username: 'outage' }, { longWaitMs: 100 }))
+    await once(back, 'spawn')
+    assert.strictEqual(server2.joins.length, 3)
+  })
+
+  it('a synchronous createBot error stops with cause config and spends no login', async () => {
+    const server = await serve((client) => spawnClient(client))
+    const errors = []
+    const pb = track(persistent(server, { version: '0.0.1' }))
+    pb.on('error', err => errors.push(err))
+    const [message, cause] = await once(pb, 'stopped')
+    await sleep(200)
+    assert.strictEqual(cause, 'config')
+    assert.match(message, /cannot create the bot/)
+    assert.strictEqual(errors.length, 1)
+    assert.strictEqual(server.joins.length, 0)
+    assert.strictEqual(pb.stats.loginsLastHour, 0, 'no budget login')
+    assert.strictEqual(hostLedger.get(`127.0.0.1:${server.port}`)?.length ?? 0, 0)
+    assert.strictEqual(pb.stats.attempts, 0)
+  })
+
+  it('a logged-in connection that is slow to spawn (a queue) is not hung; spawnTimeoutMs ends it, uncounted', async () => {
+    // login packet at once, update_health (the spawn) only later
+    const lateSpawn = (delay) => (client) => {
+      const login = registry.loginPacket
+      login.entityId = 0
+      client.write('login', login)
+      setTimeout(() => { try { client.write('update_health', { health: 20, food: 20, foodSaturation: 5 }) } catch { /* gone */ } }, delay)
+    }
+    const server = await serve(lateSpawn(1500))
+    const pb = track(persistent(server, {}, { loginTimeoutMs: 800, spawnTimeoutMs: 0 }))
+    await pb.whenOnline()
+    assert.strictEqual(pb.events.filter(e => e[0] === 'end').length, 0, 'waited for the spawn past loginTimeoutMs')
+    assert.strictEqual(pb.stats.hungLogins, 0)
+    pb.stop()
+
+    const server2 = await serve(lateSpawn(8000))
+    const slow = track(persistent(server2, { username: 'slow' }, { loginTimeoutMs: 800, spawnTimeoutMs: 700, hungLoginLimit: 1 }))
+    const [text, info] = await once(slow, 'end')
+    assert.match(text, /^spawnTimeout: no spawn within 700 ms of the login/)
+    assert.strictEqual(info.cause, 'spawn-timeout')
+    assert.strictEqual(info.action, 'retry')
+    assert.strictEqual(slow.stats.hungLogins, 0, 'not counted towards the throttle stop')
+    await until(() => server2.joins.length === 2) // reconnects with backoff
+    assert.notStrictEqual(slow.state, 'stopped')
   })
 
   describe('transfer', () => {

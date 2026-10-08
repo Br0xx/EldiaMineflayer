@@ -103,6 +103,7 @@ function makeContext (session, frame, sc) {
       return session.connect()
     },
     // Back online after a kick or a drop, for scenarios that run for long
+    loginsLastHour: () => session.loginsLastHour(),
     async revive () {
       if (session.alive) return false
       await session.connect()
@@ -229,7 +230,7 @@ async function runOne (sc, session, opts, outDir, hooks) {
     try {
       if (session.alive) {
         session.bot.clearControlStates()
-        if (session.bot.currentWindow) session.bot.closeWindow(session.bot.currentWindow)
+        if (session.bot.currentWindow) session.bot.closeWindow(session.bot.currentWindow).catch(() => {}) // may reject: the session may have ended
       }
     } catch { /* gone */ }
   }

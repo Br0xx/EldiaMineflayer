@@ -100,6 +100,13 @@ const soak = {
         cycles++
       } catch (err) {
         if (!/^(disconnected|aborted)/.test(err.message) && !ctx.session.ended) throw err
+        // A server that keeps kicking must not make the bench a login loop: stop at the keeper's hourly default
+        const logins = ctx.loginsLastHour()
+        if (ctx.opts.maxLogins > 0 && logins >= ctx.opts.maxLogins) {
+          ctx.fail(`stopped: login budget (${logins} logins in the last hour, --max-logins ${ctx.opts.maxLogins})`)
+          ctx.metric('stopped', 'login budget')
+          break
+        }
         if (++revives > 5) {
           ctx.fail('the bot was disconnected more than 5 times, soak stopped')
           break
