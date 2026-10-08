@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - 9bflayer
   pull_request:
 
 concurrency:
@@ -22,6 +23,20 @@ jobs:
         node-version: 24
     - run: npm i && npm run lint
   
+  # The suites that need no Minecraft version filter: physics against vanilla numbers, the input queue
+  # and packet-order lint, the connection keeper and the bench's self-test.
+  Offline:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Use Node.js 22.x
+      uses: actions/setup-node@v1.4.4
+      with:
+        node-version: 24
+    - run: npm i
+    - run: npx mocha --exit --retries 2 test/physicsVanillaTest.js test/vanillaUnitTest.js $(ls test/connectionTest.js bench/bench.test.js 2>/dev/null)
+
   PrepareSupportedVersions:
     runs-on: ubuntu-latest
     outputs:
