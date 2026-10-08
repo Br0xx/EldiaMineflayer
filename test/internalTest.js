@@ -715,6 +715,29 @@ for (const supportedVersion of mineflayer.testedVersions) {
       })
     })
 
+    describe('look without a movement packet', () => {
+      it('resolves where no packet can carry the turn: before the first teleport, riding, in an unloaded chunk', async function () {
+        await new Promise(resolve => {
+          server.on('playerJoin', async (client) => {
+            await bot.test.pluginsLoaded
+            client.write('login', bot.test.generateLoginPacket())
+            await once(bot, 'login')
+            resolve()
+          })
+        })
+        // no teleport yet: the server has not placed the bot
+        await bot.look(1, 0.2)
+        await bot.lookAt(vec3(3, 70, 3), true)
+        // riding
+        const Entity = require('prismarine-entity')(bot.version)
+        bot.vehicle = new Entity(90)
+        bot.emit('mount')
+        await bot.look(2, -0.2)
+        await bot.look(2.5, 0.1, true)
+        bot.vehicle = null
+      })
+    })
+
     describe('tick_end', () => {
       const basePosition = () => ({
         x: 1.5,
@@ -2483,7 +2506,8 @@ for (const supportedVersion of mineflayer.testedVersions) {
           try {
             await bot.activateItem()
             await bot.deactivateItem()
-            const placed = bot.placeEntity({ position: vec3(1, 64, 1) }, vec3(0, 1, 0))
+            // the caller aims (there is no world to ray-cast in here)
+            const placed = bot._placeEntityWithOptions({ position: vec3(1, 64, 1) }, vec3(0, 1, 0), { forceLook: 'ignore' })
             // the click and the use_item that goes with it leave in one tick
             while (!writes.some(([name, sequence]) => name === 'use_item' && sequence === 3)) await sleep(10)
             await sleep(10)
@@ -2927,9 +2951,10 @@ for (const supportedVersion of mineflayer.testedVersions) {
       const chestPos = vec3(1, 65, 2)
       const names = (list) => list.map(p => p.name)
       let client, lint, received
+      const players = new Set() // entity ids that are players, for the hit point rule of the lint
 
       // A stone floor at y = 64, a chest at (1, 65, 2), the bot standing at (1.5, 65, 4.5)
-      async function join (onBlockPlace) {
+      async function join (onBlockPlace, { withLint = true } = {}) {
         const chunk = bot.test.buildChunk()
         for (let x = 0; x < 16; x++) for (let z = 0; z < 16; z++) chunk.setBlockType(vec3(x, 64, z), registry.blocksByName.stone.id)
         chunk.setBlockType(chestPos, registry.blocksByName.chest.id)
@@ -2952,7 +2977,8 @@ for (const supportedVersion of mineflayer.testedVersions) {
           })
         })
         bot.quickBarSlot = 0
-        lint = grimLint(bot)
+        players.clear()
+        if (withLint) lint = grimLint(bot, { players })
         received.length = 0
       }
 
@@ -3094,6 +3120,394 @@ for (const supportedVersion of mineflayer.testedVersions) {
         assert.ok(out.includes('block_dig'))
       })
 
+      // --- digging, attacking, interacting, placing, riding: the packets of each tick -----------------------------
+
+      // The packets written since `received` was cleared, each with the number of the tick (tick_end) it left in
+      const timeline = () => {
+        let tick = 0
+        const out = []
+        for (const p of received) {
+          if (p.name === 'tick_end') tick++
+          else out.push({ tick, name: p.name, data: p.data })
+        }
+        return out
+      }
+      const setBlock = (pos, name) => bot._updateBlockState(pos, registry.blocksByName[name].defaultState)
+      const ticksOf = async (n) => { for (let i = 0; i < n; i++) await bot._input.nextTick() }
+      const until = async (condition, what) => {
+        for (let i = 0; i < 200 && !condition(); i++) await bot._input.nextTick()
+        assert.ok(condition(), what)
+      }
+      const Entity = () => require('prismarine-entity')(bot.version)
+      const addEntity = (id, position, o = {}) => {
+        const entity = new (Entity())(id)
+        Object.assign(entity, { position, width: 0.6, height: 1.8, type: 'mob' }, o)
+        bot.entities[id] = entity
+        if (entity.type === 'player') players.add(id)
+        return entity
+      }
+      const digs = () => timeline().filter(p => p.name === 'block_dig' && [0, 1, 2].includes(p.data.status))
+      const swingTicks = () => timeline().filter(p => p.name === 'arm_animation').map(p => p.tick)
+      const A = vec3(1, 65, 3)
+      const B = vec3(2, 65, 3)
+
+      flow('digging: START and its swing, a swing in every tick, FINISH and its swing on the completing tick', async () => {
+        setBlock(A, 'stone')
+        give(0, 'diamond_pickaxe')
+        const block = bot.blockAt(A)
+        const ticks = bot.digTime(block) / 50
+        assert.ok(ticks >= 3 && ticks < 40, `${ticks} ticks to dig the block`)
+        received.length = 0
+        let completed = null
+        bot.once('diggingCompleted', (b) => { completed = b })
+        await bot.dig(block)
+        await ticksOf(2)
+        const dig = digs()
+        assert.deepStrictEqual(dig.map(p => p.data.status), [0, 2])
+        // the face the crosshair hits: the top, seen from the eyes above the block's centre line
+        assert.strictEqual(dig[0].data.face, 1)
+        assert.strictEqual(dig[1].data.face, 1)
+        assert.strictEqual(dig[1].tick - dig[0].tick, ticks, 'FINISH follows START by the dig time in ticks')
+        assert.strictEqual(dig[1].data.sequence, dig[0].data.sequence + 1)
+        const swings = swingTicks().filter(t => t >= dig[0].tick && t <= dig[1].tick)
+        assert.deepStrictEqual(swings, Array.from({ length: ticks + 1 }, (_, i) => dig[0].tick + i), 'a swing in every tick of the dig')
+        const t = timeline()
+        for (const [what, status] of [['START', 0], ['FINISH', 2]]) {
+          const i = t.findIndex(p => p.name === 'block_dig' && p.data.status === status)
+          assert.strictEqual(t[i + 1].name, 'arm_animation', `the swing follows ${what}`)
+        }
+        assert.strictEqual(bot.blockAt(A).name, 'air')
+        assert.strictEqual(completed.name, 'air')
+        assert.strictEqual(bot.targetDigBlock, null)
+      })
+
+      flow('digging two blocks: the next START is the 6th tick after the FINISH', async () => {
+        setBlock(A, 'dirt')
+        setBlock(B, 'dirt')
+        give(0, 'diamond_shovel')
+        received.length = 0
+        await bot.dig(bot.blockAt(A))
+        await bot.dig(bot.blockAt(B))
+        await ticksOf(2)
+        const dig = digs()
+        assert.deepStrictEqual(dig.map(p => p.data.status), [0, 2, 0, 2])
+        assert.strictEqual(dig[2].tick - dig[1].tick, 6)
+        assert.strictEqual(dig[3].data.sequence, dig[2].data.sequence + 1)
+      })
+
+      flow('stopping a dig sends ABORT with face DOWN and sequence 0, and the block can be dug again', async () => {
+        setBlock(A, 'stone')
+        give(0, 'diamond_pickaxe')
+        received.length = 0
+        let aborted = null
+        bot.once('diggingAborted', (b) => { aborted = b })
+        const digging = bot.dig(bot.blockAt(A))
+        await until(() => digs().length === 1, 'no START')
+        await ticksOf(2)
+        bot.stopDigging()
+        await assert.rejects(digging, /aborted/)
+        await ticksOf(2)
+        const dig = digs()
+        assert.deepStrictEqual(dig.map(p => p.data.status), [0, 1])
+        assert.strictEqual(dig[1].data.face, 0)
+        if (dig[1].data.sequence !== undefined) assert.strictEqual(dig[1].data.sequence, 0)
+        assert.ok(dig[1].tick - dig[0].tick >= 2)
+        assert.strictEqual(aborted.position.toString(), A.toString())
+        assert.strictEqual(bot.targetDigBlock, null)
+        await bot.dig(bot.blockAt(A))
+        await ticksOf(2)
+        assert.deepStrictEqual(digs().map(p => p.data.status), [0, 1, 0, 2])
+      })
+
+      flow('moving on to another block aborts the first one with the face of the new START', async () => {
+        setBlock(A, 'stone')
+        setBlock(B, 'stone')
+        give(0, 'diamond_pickaxe')
+        received.length = 0
+        const first = bot.dig(bot.blockAt(A))
+        first.catch(() => {})
+        await until(() => digs().length === 1, 'no START')
+        await ticksOf(2)
+        await bot.dig(bot.blockAt(B))
+        await assert.rejects(first, /aborted/)
+        await ticksOf(2)
+        const dig = digs()
+        assert.deepStrictEqual(dig.map(p => p.data.status), [0, 1, 0, 2])
+        assert.strictEqual(dig[1].tick, dig[2].tick, 'the abort and the new START leave in one tick')
+        assert.strictEqual(dig[1].data.face, dig[2].data.face, 'the abort carries the face of the new START')
+        assert.deepStrictEqual([dig[1].data.location.x, dig[2].data.location.x], [1, 2])
+      })
+
+      flow('stopDigging and a new dig between two ticks: nothing of the first dig is written for the second block', async () => {
+        // (a queued FINISH used to re-read the target and land on the next block)
+        setBlock(A, 'stone')
+        setBlock(B, 'stone')
+        give(0, 'diamond_pickaxe')
+        const ticks = bot.digTime(bot.blockAt(A)) / 50
+        received.length = 0
+        // count the ticks from the bot's side: what the server received lags behind
+        let sinceStart = null
+        const write = bot._client.write
+        bot._client.write = function (name, params) {
+          if (name === 'block_dig' && params.status === 0) sinceStart = 0
+          if (name === 'tick_end' && sinceStart !== null) sinceStart++
+          return write.apply(this, arguments)
+        }
+        const first = bot.dig(bot.blockAt(A))
+        first.catch(() => {})
+        await until(() => sinceStart === ticks, 'the FINISH is due in the next tick')
+        bot.stopDigging()
+        const second = bot.dig(bot.blockAt(B))
+        await second
+        await ticksOf(2)
+        const dig = digs().map(p => [p.data.status, p.data.location.x])
+        assert.deepStrictEqual(dig, [[0, 1], [1, 1], [0, 2], [2, 2]])
+        assert.strictEqual(bot.blockAt(B).name, 'air')
+        assert.strictEqual(bot.blockAt(A).name, 'stone')
+        assert.strictEqual(bot.targetDigBlock, null)
+      })
+
+      flow('one arm swing per tick while breaking, nothing else swings in between', async () => {
+        setBlock(A, 'stone')
+        give(0, 'diamond_pickaxe')
+        received.length = 0
+        await bot.dig(bot.blockAt(A))
+        await ticksOf(2)
+        const swings = swingTicks()
+        assert.strictEqual(new Set(swings).size, swings.length, `swings per tick: ${swings}`)
+      })
+
+      flow('an instant break sends START only: a plant by hand, anything in creative (with the delay)', async () => {
+        setBlock(A, 'dandelion')
+        received.length = 0
+        await bot.dig(bot.blockAt(A))
+        await ticksOf(2)
+        assert.deepStrictEqual(digs().map(p => p.data.status), [0])
+        assert.strictEqual(bot.blockAt(A).name, 'air')
+        assert.strictEqual(swingTicks().length, 1, 'one swing, in the tick of the START')
+        // creative
+        bot.game.gameMode = 'creative'
+        setBlock(A, 'stone')
+        setBlock(B, 'stone')
+        received.length = 0
+        await bot.dig(bot.blockAt(A))
+        await bot.dig(bot.blockAt(B))
+        await ticksOf(2)
+        const dig = digs()
+        assert.deepStrictEqual(dig.map(p => p.data.status), [0, 0])
+        assert.strictEqual(dig[1].tick - dig[0].tick, 6, 'a creative START sets the same destroy delay')
+      })
+
+      flow('a dig refuses what a client could not click: a block that is gone, out of reach, or hidden', async () => {
+        received.length = 0
+        await assert.rejects(bot.dig(bot.blockAt(vec3(1, 65, 3))), err => err.code === 'no-sight') // air
+        setBlock(vec3(1, 65, 12), 'stone')
+        await assert.rejects(bot.dig(bot.blockAt(vec3(1, 65, 12))), err => err.code === 'too-far')
+        setBlock(vec3(1, 62, 3), 'stone') // under the floor
+        await assert.rejects(bot.dig(bot.blockAt(vec3(1, 62, 3))), err => err.code === 'no-sight')
+        assert.deepStrictEqual(digs(), [])
+        assert.strictEqual(bot.targetDigBlock, null)
+        // the eyes' reach is 4.5, not the old 5.1 from the block's middle
+        assert.strictEqual(bot.canDigBlock(bot.blockAt(vec3(1, 65, 12))), false)
+        assert.strictEqual(bot.canDigBlock(bot.blockAt(vec3(1, 64, 3))), true)
+      })
+
+      flow('attacking: the head turns to the hitbox first, then the attack and the swing leave together', async () => {
+        const target = addEntity(77, vec3(2.5, 65, 2.5))
+        received.length = 0
+        await bot.attack(target)
+        await ticksOf(2)
+        const t = timeline()
+        const at = t.findIndex(p => p.name === 'attack' || (p.name === 'use_entity' && p.data.mouse === 1))
+        assert.ok(at > 0, 'no attack')
+        assert.strictEqual(t[at + 1].name, 'arm_animation')
+        // the rotation the server has when the attack arrives points into the hitbox, within 3 blocks
+        const rotation = t.slice(0, at).reverse().find(p => p.data.yaw !== undefined && p.data.pitch !== undefined)
+        assert.ok(rotation, 'no rotation was sent before the attack')
+        const eye = bot.entity.position.offset(0, bot.entity.eyeHeight, 0)
+        const box = bot._aim.entityBox(target)
+        const hit = bot._aim.rayBox(eye, bot._aim.rotationDirection(rotation.data), box.min, box.max)
+        assert.ok(hit && hit.t <= 3, `the rotation does not hit the box within reach (${hit?.t})`)
+        assert.ok(rotation.tick < t[at].tick, 'the rotation was settled in an earlier tick')
+      })
+
+      flow('attacking refuses an entity that is gone or out of reach, releases a used item first, and can skip the aim', async () => {
+        const target = addEntity(77, vec3(2.5, 65, 2.5))
+        const far = addEntity(78, vec3(1.5, 65, -6))
+        received.length = 0
+        await assert.rejects(bot.attack(far), err => err.code === 'too-far')
+        assert.deepStrictEqual(await bot.vanilla.attackEntity(far), { ok: false, reason: 'too-far' })
+        delete bot.entities[77]
+        await assert.rejects(bot.attack(target), err => err.code === 'gone')
+        await assert.rejects(bot.attack({ id: 999, position: vec3(0, 0, 0) }), err => err.code === 'gone')
+        assert.deepStrictEqual(await bot.vanilla.attackEntity(target), { ok: false, reason: 'gone' })
+        await ticksOf(2)
+        assert.ok(!names(received).includes('attack') && !received.some(p => p.name === 'use_entity'), 'nothing was attacked')
+
+        // eating: the use is released in a tick of its own, before the attack
+        addEntity(77, vec3(2.5, 65, 2.5))
+        give(0, 'bread', 3)
+        bot.food = 10
+        await bot.activateItem()
+        assert.strictEqual(bot.usingHeldItem, true)
+        received.length = 0
+        await bot.attack(bot.entities[77])
+        assert.strictEqual(bot.usingHeldItem, false)
+        await ticksOf(2)
+        const t = timeline()
+        const release = t.find(p => p.name === 'block_dig' && p.data.status === 5)
+        const attackPacket = t.find(p => p.name === 'attack' || (p.name === 'use_entity' && p.data.mouse === 1))
+        assert.ok(release && attackPacket && release.tick < attackPacket.tick, 'the release comes in an earlier tick')
+
+        // aim: false leaves the head alone
+        await ticksOf(2)
+        const yaw = bot.entity.yaw
+        const pitch = bot.entity.pitch
+        received.length = 0
+        await bot.attack(bot.entities[77], { aim: false })
+        await ticksOf(2)
+        assert.deepStrictEqual([bot.entity.yaw, bot.entity.pitch], [yaw, pitch])
+        assert.ok(received.some(p => p.name === 'attack' || (p.name === 'use_entity' && p.data.mouse === 1)))
+        await assert.rejects(bot.attack(far, { aim: false }), err => err.code === 'too-far')
+      })
+
+      flow('interacting: the hit point lies inside the hitbox, INTERACT_AT and INTERACT agree', async () => {
+        const target = addEntity(79, vec3(0.5, 65, 2.5), { type: 'player', username: 'other' })
+        received.length = 0
+        await bot.useOn(target)
+        await bot.activateEntityAt(target, vec3(0.5, 90, 2.5)) // far above the hitbox: clamped into it
+        assert.deepStrictEqual(await bot.vanilla.interactEntity(target), { ok: true })
+        await ticksOf(2)
+        const uses = timeline().filter(p => p.name === 'use_entity')
+        const paired = !bot.supportFeature('attackUsesOwnPacket')
+        assert.strictEqual(uses.length, paired ? 6 : 3)
+        for (let i = 0; i < uses.length; i += paired ? 2 : 1) {
+          const at = uses[i].data
+          const point = paired ? at : at.location
+          assert.ok(Math.abs(point.x) < 0.3001 && Math.abs(point.z) < 0.3001 && point.y > -0.0001 && point.y < 1.8001, `hit point ${point.x} ${point.y} ${point.z}`)
+          if (paired) {
+            assert.strictEqual(at.mouse, 2)
+            assert.strictEqual(uses[i + 1].data.mouse, 0)
+            assert.deepStrictEqual([uses[i + 1].data.target, uses[i + 1].data.hand, uses[i + 1].data.sneaking], [at.target, at.hand, at.sneaking])
+            assert.strictEqual(uses[i + 1].tick, uses[i].tick, 'the pair leaves in one tick')
+          }
+        }
+        // a stale id is refused
+        delete bot.entities[79]
+        await assert.rejects(bot.useOn(target), err => err.code === 'gone')
+        await assert.rejects(bot.mount(target), err => err.code === 'gone')
+      })
+
+      flow('placing: the face and the point come from the ray-cast, a hidden face, a missing block and a far one are refused', async () => {
+        give(0, 'stone', 9)
+        const floor = bot.blockAt(vec3(2, 64, 3))
+        received.length = 0
+        await bot._genericPlace(floor, vec3(0, 1, 0), { swingArm: 'right' })
+        await ticksOf(2)
+        const t = timeline()
+        const place = t.find(p => p.name === 'block_place')
+        assert.ok(place)
+        assert.strictEqual(place.data.direction, 1)
+        const cursor = vec3(place.data.cursorX, place.data.cursorY, place.data.cursorZ)
+        assert.ok(Math.abs(cursor.y - 1) < 1e-6, `the cursor ${cursor} is on the top face`)
+        assert.ok(cursor.x > 0 && cursor.x < 1 && cursor.z > 0 && cursor.z < 1)
+        assert.strictEqual(t[t.indexOf(place) + 1].name, 'arm_animation')
+        // the rotation on the server points at that very point
+        const rotation = t.slice(0, t.indexOf(place)).reverse().find(p => p.data.yaw !== undefined && p.data.pitch !== undefined)
+        const eye = bot.entity.position.offset(0, bot.entity.eyeHeight, 0)
+        const dir = bot._aim.rotationDirection(rotation.data)
+        const k = (floor.position.y + 1 - eye.y) / dir.y
+        assert.ok(eye.plus(dir.scaled(k)).distanceTo(floor.position.plus(cursor)) < 0.05, 'the head does not face the reported point')
+
+        received.length = 0
+        await assert.rejects(bot._genericPlace(floor, vec3(0, -1, 0), {}), err => err.code === 'no-sight') // the underside, from above
+        await assert.rejects(bot._genericPlace({ position: vec3(5, 70, 5) }, vec3(0, 1, 0), {}), err => ['too-far', 'no-sight'].includes(err.code))
+        await assert.rejects(bot._genericPlace(bot.blockAt(vec3(1, 64, 14)), vec3(0, 1, 0), {}), err => err.code === 'too-far')
+        await ticksOf(2)
+        assert.ok(!names(received).includes('block_place'), 'nothing was placed')
+
+        // two placements asked for together go out in two ticks
+        received.length = 0
+        await Promise.all([
+          bot._genericPlace(floor, vec3(0, 1, 0), { swingArm: 'right' }),
+          bot._genericPlace(floor, vec3(0, 1, 0), { swingArm: 'right' })
+        ])
+        await ticksOf(2)
+        const places = timeline().filter(p => p.name === 'block_place')
+        assert.strictEqual(places.length, 2)
+        assert.notStrictEqual(places[0].tick, places[1].tick)
+      })
+
+      flow('a click without a face aims for one: no default top face', async () => {
+        give(0, 'stone')
+        received.length = 0
+        // the chest at (1, 65, 2) is seen from the south; a default top face would be above the eyes' plane
+        await bot.activateBlock(bot.blockAt(chestPos))
+        await ticksOf(2)
+        const click = received.find(p => p.name === 'block_place')
+        assert.ok(click)
+        assert.strictEqual(click.data.direction, 3)
+      })
+
+      flow('starting to glide: the jump key is up when the start leaves, and goes down in the same tick', async () => {
+        if (!bot.supportFeature('newPlayerInputPacket')) return
+        bot.inventory.updateSlot(bot.getEquipmentDestSlot('torso'), new Item(registry.itemsByName.elytra.id, 1))
+        bot.setControlState('jump', true)
+        await ticksOf(3)
+        assert.strictEqual(bot.entity.onGround, false)
+        received.length = 0
+        await bot.elytraFly()
+        await ticksOf(3)
+        const t = timeline().filter(p => ['entity_action', 'player_input'].includes(p.name))
+        const names = t.map(p => p.name === 'entity_action' ? p.data.actionId : `input:${p.data.inputs.jump}`)
+        // jump released (if it was down), then the start with the key going down right behind it
+        const start = names.findIndex(n => /elytra|fall_flying/.test(n))
+        assert.ok(start >= 0, names.join())
+        assert.strictEqual(names[start + 1], 'input:true')
+        assert.ok(!names.slice(0, start).includes('input:true'), 'the key was up when the start left')
+        assert.strictEqual(t[start].tick, t[start + 1].tick, 'in one tick')
+      })
+
+      flow('riding: the keys go out once when they change, the shift key leaves, no sneak or sprint action', async () => {
+        if (!bot.supportFeature('newPlayerInputPacket')) return
+        bot.vehicle = addEntity(90, vec3(1.5, 65, 4.5), { type: 'object' })
+        bot.emit('mount')
+        received.length = 0
+        bot.moveVehicle(1, 1)
+        await ticksOf(4)
+        bot.dismount()
+        await ticksOf(6)
+        bot.vehicle = null
+        bot.emit('dismount')
+        await ticksOf(3)
+        const inputs = received.filter(p => p.name === 'player_input').map(p => p.data.inputs)
+        assert.deepStrictEqual(inputs.map(i => [i.forward, i.left, i.shift]), [[true, true, false], [true, true, true], [true, true, false]])
+        assert.ok(!received.some(p => p.name === 'entity_action'), 'no sneak or sprint action while riding')
+        assert.strictEqual(bot.getControlState('forward'), false, 'the steering keys are released on the way out')
+      })
+
+      it('before 1.21.2 the keys of a ride go out as steer_vehicle in every tick, at most 0.98, the shift key leaves', async function () {
+        if (bot.supportFeature('newPlayerInputPacket')) return this.skip()
+        await join(undefined, { withLint: false })
+        const boat = addEntity(90, vec3(1.5, 65, 4.5), { type: 'object' })
+        bot.vehicle = boat
+        bot.emit('mount')
+        received.length = 0
+        bot.moveVehicle(1, -1)
+        await ticksOf(4)
+        bot.dismount()
+        await ticksOf(5)
+        bot.vehicle = null
+        bot.emit('dismount')
+        await ticksOf(2)
+        const steer = received.filter(p => p.name === 'steer_vehicle').map(p => p.data)
+        assert.ok(steer.length >= 8, `${steer.length} steer_vehicle packets in 9 ticks`)
+        for (const p of steer) assert.ok(Math.abs(p.sideways) <= Math.fround(0.98) && Math.abs(p.forward) <= Math.fround(0.98))
+        assert.deepStrictEqual([steer[0].sideways, steer[0].forward, steer[0].jump], [Math.fround(0.98), -Math.fround(0.98), 0])
+        assert.ok(steer.some(p => p.jump & 2), 'the shift key (unmount) is sent')
+        assert.ok(!received.some(p => p.name === 'entity_action'), 'no sneak or sprint action while riding')
+      })
+
       flow('a window: opened with a click, clicked and closed only once the movement keys are released', async function () {
         // the server answers the click with a chest window
         const pWindows = require('prismarine-windows')(supportedVersion)
@@ -3230,6 +3644,24 @@ for (const supportedVersion of mineflayer.testedVersions) {
         while (Date.now() < stallUntil) { /* busy wait */ }
         await sleep(1000)
         assert.ok(lint.ticksPerSecond() <= 22, `${lint.ticksPerSecond()} ticks in a second`)
+      })
+    })
+
+    describe('guards against what the Grim anticheat flags', () => {
+      it('refuses a view distance below 2, a tab complete it would cancel', async () => {
+        await bot.test.pluginsLoaded
+        for (const viewDistance of [1, 0, -3, 1.5, 200]) {
+          assert.throws(() => bot.setSettings({ viewDistance }), /invalid view distance/, `${viewDistance}`)
+        }
+        bot.settings.viewDistance = 'far'
+        await assert.rejects(bot.tabComplete('x'.repeat(257), false, false), /at most 256/)
+        await assert.rejects(bot.tabComplete('x'.repeat(65), false, false), /needs a space/)
+        await assert.rejects(bot.tabComplete(`${'x'.repeat(70)} y`, false, false), /needs a space/)
+      })
+
+      it('knows how long an anvil name may be', () => {
+        const anvilNameLimit = require('../lib/plugins/anvil').nameLimit
+        assert.strictEqual(anvilNameLimit(registry), version['>=']('1.17') ? 50 : version['>=']('1.12') ? 35 : version['>=']('1.11.1') ? 31 : 30)
       })
     })
 

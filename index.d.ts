@@ -91,18 +91,22 @@ export interface VanillaInteract {
    */
   openContainer: (block: Block, options?: Partial<VanillaInteractOptions>) => Promise<Window>
   /** Close the open window, if any (do this before walking) */
-  closeAnyWindow: () => void
+  closeAnyWindow: () => Promise<void>
   /** Wait until the bot stands on the ground without horizontal speed; resolves false after `maxTicks` @default 20 */
   standStill: (maxTicks?: number) => Promise<boolean>
   /** Look at a point and wait for the rotation to reach the server */
   lookSettled: (point: Vec3, ticks?: number) => Promise<void>
+  /** Aim at the entity's hitbox, settle, attack and swing; a result instead of an error */
+  attackEntity: (entity: Entity, options?: EntityActionOptions) => Promise<{ ok: true } | { ok: false, reason: 'gone' | 'too-far' | 'no-sight' | 'moved' }>
+  /** Aim at the entity's hitbox, settle, right-click it (INTERACT_AT and INTERACT); a result instead of an error */
+  interactEntity: (entity: Entity, options?: EntityActionOptions) => Promise<{ ok: true } | { ok: false, reason: 'gone' | 'too-far' | 'no-sight' | 'moved' }>
   /** A point on the block the eyes can see within reach, or null */
   visiblePoint: (block: Block, reach?: number) => Vec3 | null
   /** One inventory click followed by a `clickGapMs` pause */
   windowClick: (slot: number, mouseButton: number, mode: number, options?: Partial<VanillaInteractOptions>) => Promise<void>
   shiftClick: (slot: number, options?: Partial<VanillaInteractOptions>) => Promise<void>
   /** The swap-hands key (block_dig status 6, sequence 0) */
-  swapHands: () => void
+  swapHands: () => Promise<void>
   /** Move a matching hotbar item to the offhand with swap-hands; false if none is in the hotbar */
   offhandFromHotbar: (match: (item: Item) => boolean) => Promise<boolean>
   /** Move a matching main-inventory item to the hotbar with a number-key click; resolves with the hotbar index or -1 */
@@ -410,9 +414,9 @@ export interface Bot extends TypedEmitter<BotEvents> {
 
   activateBlock: (block: Block, direction?: Vec3, cursorPos?: Vec3) => Promise<void>
 
-  activateEntity: (entity: Entity) => Promise<void>
+  activateEntity: (entity: Entity, options?: EntityActionOptions) => Promise<void>
 
-  activateEntityAt: (entity: Entity, position: Vec3) => Promise<void>
+  activateEntityAt: (entity: Entity, position: Vec3, options?: EntityActionOptions) => Promise<void>
 
   consume: () => Promise<void>
 
@@ -422,13 +426,13 @@ export interface Bot extends TypedEmitter<BotEvents> {
 
   deactivateItem: () => Promise<void>
 
-  useOn: (targetEntity: Entity) => Promise<void>
+  useOn: (targetEntity: Entity, options?: EntityActionOptions) => Promise<void>
 
-  attack: (entity: Entity) => Promise<void>
+  attack: (entity: Entity, options?: EntityActionOptions) => Promise<void>
 
   swingArm: (hand: 'left' | 'right' | undefined, showHand?: boolean) => Promise<void>
 
-  mount: (entity: Entity) => Promise<void>
+  mount: (entity: Entity, options?: EntityActionOptions) => Promise<void>
 
   dismount: () => void
 
@@ -992,3 +996,13 @@ export function supportFeature (feature: string, version: string): boolean
 /** Number of undecodable packets skipped so far (see `skipUndecodablePackets`) */
 export function protodefSkipped (): number
 export function installProtodefGuard (): boolean
+
+/** What attack, useOn, mount and activateEntity* take: aiming is on by default (turn to the hitbox, settle, check the ray). Errors carry `code`: 'gone' | 'too-far' | 'no-sight' | 'moved'. */
+export interface EntityActionOptions {
+  /** false: don't turn to the entity (the reach and stale-id checks remain) */
+  aim?: boolean
+  /** range in blocks, default the entity_interaction_range attribute (3.0) */
+  reach?: number
+  /** interactions: the world point to aim at, clamped into the hitbox */
+  point?: Vec3
+}

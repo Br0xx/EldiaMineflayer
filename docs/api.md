@@ -1980,16 +1980,20 @@ This function returns a `Promise`, with `void` as its argument when the block is
 Begin digging into `block` with the currently equipped item.
 See also "diggingCompleted" and "diggingAborted" events.
 
-Note that once you begin digging into a block, you may not
-dig any other blocks until the block has been broken, or you call
-`bot.stopDigging()`.
+The dig is a state machine that runs in the ticks, like the vanilla client's: the bot turns to a visible point of the
+block, waits for the rotation to reach the server, and START goes out with the face the crosshair ray hits (from the
+eyes, within the block reach: 4.5, or the `block_interaction_range` attribute). Every tick of the dig has one arm swing;
+the FINISH (with its swing) leaves on the tick the break progress reaches 1.0. A block that breaks at once (creative,
+or a plant by hand) gets a START only. After a break the next START waits 5 ticks. The dig is dropped with an
+ABORT (face down) when the crosshair or the reach leaves the block, and a dig on another block aborts the first one
+with the face of the new START. A block that is gone, out of reach or hidden is refused (error `code` 'too-far' or
+'no-sight'); an item in use is released first.
+
+Digging the block the bot is already digging just waits for that dig. Digging another one gives up the first.
 
  * `block` - the block to start digging into
- * `forceLook` - (optional) if true, the bot snaps its head to the block and starts mining instantly. If false or omitted, the bot turns its head to the block at its normal look rate and waits for the turn to finish before digging. Can also be assigned 'ignore' to prevent the bot from moving its head at all.
- * `digFace` - (optional) Default is 'auto' looks at the center of the block and mines the top face. Can also be a vec3 vector
- of the face the bot should be looking at when digging the block. For example: ```vec3(0, 1, 0)``` when mining the top. Can also be 'raycast' raycast checks if there is a face visible by the bot and mines that face. Useful for servers with anti cheat.
-
-If you call bot.dig twice before the first dig is finished, you will get a fatal 'diggingAborted' error.
+ * `forceLook` - (optional) 'ignore' keeps the bot from turning its head at all (the caller aims; the face is then the one the eyes look at). Anything else turns to the block and waits.
+ * `digFace` - (optional) Default is 'auto': look at whatever side of the block the eyes can see. Can also be a vec3 vector of the face to look at, for example `vec3(0, 1, 0)` for the top ('raycast' is the same as 'auto').
 
 #### bot.stopDigging()
 
@@ -2033,7 +2037,7 @@ This function returns a `Promise`, with `void` as its argument upon completion.
 Punch a note block, open a door, etc.
 
  * `block` - the block to activate
- * `direction` Optional defaults to `new Vec3(0, 1, 0)` (up). A vector off the direction the container block should be interacted with. Does nothing when a container entity is targeted.
+ * `direction` Optional. Without it the bot aims for a visible face like a vanilla player and reports the face and point its crosshair hits (a block that is out of reach or hidden is refused); there is no default face. A vector off the direction the container block should be interacted with. Does nothing when a container entity is targeted.
  * `cursorPos` Optional defaults to `new Vec3(0.5, 0.5, 0.5)` (block center). The curos position when opening the block instance. This is send with the activate block packet. Does nothing when a container entity is targeted.
 
 #### bot.activateEntity(entity)
@@ -2090,14 +2094,20 @@ next physics tick, in the order of the vanilla client (selected slot, swap, one 
 packet). Of the actions that click, attack, use or release, one goes out per tick; the rest wait for the next. Their
 promises resolve after the packet is written.
 
-#### bot.useOn(targetEntity)
+#### bot.useOn(targetEntity, [options])
 
 Use the currently held item on an `Entity` instance. This is how you apply a saddle and
-use shears.
+use shears. Like `bot.attack`, `bot.mount` and `bot.activateEntity(At)` it turns to the entity's hitbox, waits for the
+rotation to reach the server, and sends the point the crosshair hits (INTERACT_AT, then INTERACT). Options: `aim: false`
+(don't turn; the reach check remains), `reach`, `point` (where to aim). Errors carry a `code`: 'gone' (the entity is no
+longer in `bot.entities`), 'too-far', 'no-sight', 'moved'. `bot.vanilla.attackEntity` / `interactEntity` return
+`{ ok, reason }` instead of throwing.
 
-#### bot.attack(entity)
+#### bot.attack(entity, [options])
 
-Attack a player or a mob. The attack is always followed by the swing of the arm, like a click of the vanilla client.
+Attack a player or a mob. The head turns to the hitbox first and the attack must be within `entity_interaction_range`
+(3.0) of the eyes; an item in use is released first. The attack is always followed by the swing of the arm, like a click
+of the vanilla client. See `bot.useOn` for the options and errors.
 
  * `entity` is a type of entity. To get a specific entity use [bot.nearestEntity()](#botnearestentitymatch--entity---return-true-) or [bot.entities](#botentities).
 
@@ -2114,7 +2124,7 @@ Mount a vehicle. To get back out, use `bot.dismount`.
 
 #### bot.dismount()
 
-Dismounts from the vehicle you are in.
+Dismounts from the vehicle you are in: the shift key is held for a few ticks.
 
 #### bot.moveVehicle(left,forward)
 
@@ -2123,7 +2133,10 @@ Moves the vehicle :
  * left can take -1 or 1 : -1 means right, 1 means left
  * forward can take -1 or 1 : -1 means backward, 1 means forward
 
-All the direction are relative to where the bot is looking at
+All the direction are relative to where the bot is looking at.
+
+The keys hold until changed, and are sent once per tick when they change (`player_input`; before 1.21.2 `steer_vehicle`
+in every tick, at most 0.98). They are released when the bot gets off.
 
 #### bot.setQuickBarSlot(slot)
 
@@ -2152,7 +2165,7 @@ This function returns a `Promise`, with `void` as its argument when the writing 
 Opens a block container or entity.
 
  * `containerBlock` or `containerEntity` The block instance to open or the entity to open.
- * `direction` Optional defaults to `new Vec3(0, 1, 0)` (up). A vector off the direction the container block should be interacted with. Does nothing when a container entity is targeted.
+ * `direction` Optional. Without it the bot aims for a visible face like a vanilla player and reports the face and point its crosshair hits (a block that is out of reach or hidden is refused); there is no default face. A vector off the direction the container block should be interacted with. Does nothing when a container entity is targeted.
  * `cursorPos` Optional defaults to `new Vec3(0.5, 0.5, 0.5)` (block center). The curos position when opening the block instance. This is send with the activate block packet. Does nothing when a container entity is targeted.
 
 Returns a promise on a `Container` instance which represents the container you are opening.
@@ -2281,7 +2294,7 @@ Transfer some kind of item from one range to an other. `options` is an object co
 Open a block, for example a chest, returns a promise on the opening `Window`.
 
  * `block` is the block the bot will open.
- * `direction` Optional defaults to `new Vec3(0, 1, 0)` (up). A vector off the direction the container block should be interacted with. Does nothing when a container entity is targeted.
+ * `direction` Optional. Without it the bot aims for a visible face like a vanilla player and reports the face and point its crosshair hits (a block that is out of reach or hidden is refused); there is no default face. A vector off the direction the container block should be interacted with. Does nothing when a container entity is targeted.
  * `cursorPos` Optional defaults to `new Vec3(0.5, 0.5, 0.5)` (block center). The curos position when opening the block instance. This is send with the activate block packet. Does nothing when a container entity is targeted.
 
 #### bot.openEntity(entity)

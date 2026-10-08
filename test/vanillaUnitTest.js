@@ -148,7 +148,7 @@ describe('9bflayer connection guards', function () {
     }
     const pos = { x: 1, y: 65, z: 1, yaw: 10, pitch: 0, onGround: true, flags: { onGround: true } }
     const tick = (send, extra = {}) => { send('position_look', { ...pos, ...extra }); send('tick_end') }
-    const place = { location: vec3(0, 0, 0), direction: 1, cursorX: 0.5, cursorY: 1, cursorZ: 0.5, sequence: 1 }
+    const place = { location: vec3(1, 64, 1), direction: 1, cursorX: 0.5, cursorY: 1, cursorZ: 0.5, sequence: 1 }
 
     it('accepts a vanilla tick', () => {
       const { send, ids } = lintFor('1.21.4')
@@ -185,13 +185,55 @@ describe('9bflayer connection guards', function () {
         ['PacketOrderG', (send) => { send('block_place', place); send('block_dig', { status: 6, location: vec3(0, 0, 0), face: 0, sequence: 0 }) }],
         ['BadPacketsL', (send) => send('block_dig', { status: 6, location: vec3(0, 0, 0), face: 3, sequence: 0 })],
         ['TickTimer', (send) => { send('position_look', pos); send('position_look', { ...pos, yaw: 11 }) }],
-        ['PacketOrderC', (send) => { send('use_entity', { target: 1, mouse: 0 }) }]
+        ['PacketOrderC', (send) => { send('use_entity', { target: 1, mouse: 0 }) }],
+        // pos is (1, 65, 1): the eyes are at 66.62 / 66.27
+        ['PositionBreakA', (send) => { tick(send); send('block_dig', { status: 0, location: vec3(1, 70, 1), face: 1, sequence: 1 }) }],
+        ['FarBreak', (send) => { tick(send); send('block_dig', { status: 0, location: vec3(9, 65, 1), face: 5, sequence: 1 }) }],
+        ['PositionPlace', (send) => { tick(send); send('block_place', { ...place, location: vec3(1, 70, 1), direction: 1 }) }],
+        ['FarPlace', (send) => { tick(send); send('block_place', { ...place, location: vec3(1, 64, 12) }) }],
+        ['FastBreak', (send) => {
+          tick(send)
+          const dig = (status) => { send('block_dig', { status, location: vec3(1, 64, 1), face: 1, sequence: status === 0 ? 1 : 2 }); send('arm_animation', {}) }
+          dig(0); tick(send, { yaw: 11 }); dig(2); for (let i = 0; i < 4; i++) tick(send, { yaw: 12 + i }); dig(0)
+        }],
+        ['WrongBreak', (send) => { tick(send); send('block_dig', { status: 0, location: vec3(1, 64, 1), face: 1, sequence: 1 }); send('block_dig', { status: 2, location: vec3(1, 64, 2), face: 1, sequence: 2 }) }],
+        ['PositionBreakB', (send) => { tick(send); send('block_dig', { status: 1, location: vec3(1, 64, 1), face: 3, sequence: 0 }); tick(send, { yaw: 11 }); send('block_dig', { status: 0, location: vec3(1, 64, 1), face: 1, sequence: 1 }) }],
+        ['VehicleA', (send) => send('steer_vehicle', { sideways: 1, forward: 0, jump: 0 })]
       ]
       for (const [id, run] of cases) {
         const { send, ids } = lintFor('1.21.4')
         run(send)
         assert.ok(ids().includes(id), `${id} not reported, got ${ids()}`)
       }
+    })
+
+    it('accepts a vanilla dig: abort with a new face, START with it, FINISH 6 ticks before the next START', () => {
+      const { send, ids } = lintFor('1.21.4')
+      tick(send)
+      const dig = (status, extra = {}) => { send('block_dig', { status, location: vec3(1, 64, 1), face: 1, sequence: status === 1 ? 0 : 1, ...extra }); send('arm_animation', {}) }
+      send('block_dig', { status: 1, location: vec3(2, 64, 1), face: 1, sequence: 0 })
+      dig(0)
+      tick(send, { yaw: 11 })
+      send('block_dig', { status: 2, location: vec3(1, 64, 1), face: 1, sequence: 2 })
+      send('arm_animation', {})
+      for (let i = 0; i < 6; i++) tick(send, { yaw: 12 + i })
+      send('block_dig', { status: 0, location: vec3(1, 64, 1), face: 1, sequence: 3 })
+      send('arm_animation', {})
+      assert.deepStrictEqual(ids(), [])
+    })
+
+    it('checks the hit point of an interaction with a player', () => {
+      const lint = (point) => {
+        const registry = require('prismarine-registry')('1.21.4')
+        const bot = { registry, supportFeature: registry.supportFeature, _client: Object.assign(new EventEmitter(), { write () {} }) }
+        const l = grimLint(bot, { report () {}, players: new Set([5]) })
+        bot._client.write('use_entity', { target: 5, mouse: 2, ...point })
+        bot._client.write('use_entity', { target: 5, mouse: 0 })
+        return l.violations.map(v => v.id)
+      }
+      assert.deepStrictEqual(lint({ x: 0.1, y: 1, z: -0.2 }), [])
+      assert.deepStrictEqual(lint({ x: 0.5, y: 1, z: 0 }), ['InvalidInteractCursor'])
+      assert.deepStrictEqual(lint({ x: 0, y: 2, z: 0 }), ['InvalidInteractCursor'])
     })
 
     it('answers a server rotation like a teleport: exactly, in the air, and it is no tick', () => {
@@ -213,6 +255,28 @@ describe('9bflayer connection guards', function () {
       assert.deepStrictEqual(lint.violations.map(v => v.id), ['BadPacketsB'])
       assert.deepStrictEqual(ids(), [])
       assert.ok(send)
+    })
+  })
+
+  describe('aim helpers', () => {
+    const { rayBox, distanceToBox } = require('../lib/plugins/aim')
+    it('finds where a ray enters a box, and the face', () => {
+      const min = vec3(0, 0, 0)
+      const max = vec3(1, 1, 1)
+      let hit = rayBox(vec3(0.5, 5, 0.5), vec3(0, -1, 0), min, max)
+      assert.deepStrictEqual([hit.t, hit.face, hit.point.y], [4, 1, 1]) // enters through the top
+      hit = rayBox(vec3(-3, 0.5, 0.5), vec3(1, 0, 0), min, max)
+      assert.deepStrictEqual([hit.t, hit.face], [3, 4]) // the west face
+      hit = rayBox(vec3(0.5, 0.5, 4), vec3(0, 0, -1), min, max)
+      assert.strictEqual(hit.face, 3) // the south face
+      assert.strictEqual(rayBox(vec3(5, 5, 5), vec3(0, 1, 0), min, max), null)
+      assert.strictEqual(rayBox(vec3(0.5, 0.5, 0.5), vec3(1, 0, 0), min, max).t, 0, 'from inside')
+      assert.strictEqual(rayBox(vec3(0.5, 5, 0.5), vec3(0, 1, 0), min, max), null, 'behind the ray')
+    })
+    it('measures the distance to a box', () => {
+      assert.strictEqual(distanceToBox(vec3(0.5, 0.5, 0.5), vec3(0, 0, 0), vec3(1, 1, 1)), 0)
+      assert.strictEqual(distanceToBox(vec3(4, 0.5, 0.5), vec3(0, 0, 0), vec3(1, 1, 1)), 3)
+      assert.ok(Math.abs(distanceToBox(vec3(4, 5, 0.5), vec3(0, 0, 0), vec3(1, 1, 1)) - 5) < 1e-12)
     })
   })
 
