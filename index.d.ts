@@ -290,6 +290,9 @@ export interface Bot extends TypedEmitter<BotEvents> {
   _client: Client
   heldItem: Item | null
   usingHeldItem: boolean
+  itemInUse: boolean
+  sprinting: boolean
+  crouching: boolean
   currentWindow: Window | null
   simpleClick: simpleClick
   tablist: Tablist
@@ -415,23 +418,23 @@ export interface Bot extends TypedEmitter<BotEvents> {
 
   fish: () => Promise<void>
 
-  activateItem: (offhand?: boolean) => void
+  activateItem: (offhand?: boolean) => Promise<void>
 
-  deactivateItem: () => void
+  deactivateItem: () => Promise<void>
 
-  useOn: (targetEntity: Entity) => void
+  useOn: (targetEntity: Entity) => Promise<void>
 
-  attack: (entity: Entity) => void
+  attack: (entity: Entity) => Promise<void>
 
-  swingArm: (hand: 'left' | 'right' | undefined, showHand?: boolean) => void
+  swingArm: (hand: 'left' | 'right' | undefined, showHand?: boolean) => Promise<void>
 
-  mount: (entity: Entity) => void
+  mount: (entity: Entity) => Promise<void>
 
   dismount: () => void
 
   moveVehicle: (left: number, forward: number) => void
 
-  setQuickBarSlot: (slot: number) => void
+  setQuickBarSlot: (slot: number) => Promise<void>
 
   craft: (
     recipe: Recipe,

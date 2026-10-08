@@ -97,6 +97,8 @@
       - [bot.spawnPoint](#botspawnpoint)
       - [bot.heldItem](#bothelditem)
       - [bot.usingHeldItem](#botusinghelditem)
+      - [bot.sprinting](#botsprinting)
+      - [bot.crouching](#botcrouching)
       - [bot.game.levelType](#botgameleveltype)
       - [bot.game.dimension](#botgamedimension)
       - [bot.game.difficulty](#botgamedifficulty)
@@ -319,7 +321,7 @@
       - [bot.activateItem(offHand=false)](#botactivateitemoffhandfalse)
       - [bot.deactivateItem()](#botdeactivateitem)
       - [bot.useOn(targetEntity)](#botuseontargetentity)
-      - [bot.attack(entity, swing = true)](#botattackentity-swing--true)
+      - [bot.attack(entity)](#botattackentity)
       - [bot.swingArm([hand], showHand)](#botswingarmhand-showhand)
       - [bot.mount(entity)](#botmountentity)
       - [bot.dismount()](#botdismount)
@@ -882,7 +884,19 @@ The item in the bot's hand, represented as a [prismarine-item](https://github.co
 
 #### bot.usingHeldItem
 
-Whether the bot is using the item that it's holding, for example eating food or using a shield.
+Whether the bot is using the item that it's holding, for example eating food or using a shield. Also available as
+`bot.itemInUse`. It starts with an `activateItem()` that begins a use (food when hungry or always edible, potions, bows,
+shields, tridents, spyglasses, goat horns...) and ends on `deactivateItem()`, when the item is used up, when the
+selected slot or the item changes, on death, or when the server says the bot stopped using it. Walking while using an
+item is slowed to 20 %.
+
+#### bot.sprinting
+
+#### bot.crouching
+
+The state the last tick was simulated with. `bot.setControlState('sprint', true)` only holds the sprint key: the bot
+sprints while it moves forward and may, by the rules of the vanilla client (enough food, not sneaking, not using an item,
+not against a wall...). `bot.crouching` follows the sneak key one tick later, like the pose of the vanilla client.
 
 #### bot.game.levelType
 
@@ -1896,9 +1910,13 @@ This function returns a `Promise`, with `void` as its argument when you are look
 
 #### bot.look(yaw, pitch, [force])
 
-This function returns a `Promise`, with `void` as its argument called when you are looking at `yaw` and `pitch`.
+This function returns a `Promise`, with `void` as its argument called when a movement packet carrying `yaw` and `pitch`
+has been sent.
 
-Set the direction your head is facing.
+Set the direction your head is facing. The yaw takes the shorter way round, the pitch is limited to +-pi/2 and both
+are rounded to what a mouse can do. The movement packet of a tick carries exactly the rotation that tick was simulated
+with, so a turn takes effect on the next tick. `bot.physics.yawSpeed` and `bot.physics.pitchSpeed` (radians per second)
+are `Infinity` by default; give them a finite value to turn gradually.
 
  * `yaw` - The number of radians to rotate around the vertical axis, starting
    from due east. Counter clockwise.
@@ -2056,21 +2074,32 @@ egg, activate firework rockets, etc.
 
 Optional parameter is `false` for main hand and `true` for off hand.
 
+Like every action of the bot this goes out with the next tick, once per tick (see "One action per tick" below), and
+the returned `Promise` resolves when the packet is written.
+
 #### bot.deactivateItem()
 
-Deactivates the currently held item. This is how you release an arrow, stop eating, etc.
+Deactivates the currently held item. This is how you release an arrow, stop eating, etc. Returns a `Promise`
+that resolves when the packet is written.
+
+##### One action per tick
+
+`activateItem`, `deactivateItem`, `activateBlock`, `placeBlock`, `attack`, `useOn`, `mount`, `dig`, `swingArm`,
+`setQuickBarSlot` and `vanilla.swapHands` do not write their packets at once: they are queued and written inside the
+next physics tick, in the order of the vanilla client (selected slot, swap, one action with its swing, then the movement
+packet). Of the actions that click, attack, use or release, one goes out per tick; the rest wait for the next. Their
+promises resolve after the packet is written.
 
 #### bot.useOn(targetEntity)
 
 Use the currently held item on an `Entity` instance. This is how you apply a saddle and
 use shears.
 
-#### bot.attack(entity, swing = true)
+#### bot.attack(entity)
 
-Attack a player or a mob.
+Attack a player or a mob. The attack is always followed by the swing of the arm, like a click of the vanilla client.
 
  * `entity` is a type of entity. To get a specific entity use [bot.nearestEntity()](#botnearestentitymatch--entity---return-true-) or [bot.entities](#botentities).
- * `swing` Default to `true`. If false the bot does not swing its arm when attacking.
 
 #### bot.swingArm([hand], showHand)
 

@@ -9,12 +9,16 @@ const nbt = require('prismarine-nbt')
 const { once, onceWithCleanup } = require('../lib/promise_utils')
 const { EventEmitter } = require('events')
 const { getPort } = require('./common/util')
+const grimLint = require('./grimLint')
 
 for (const supportedVersion of mineflayer.testedVersions) {
   const registry = require('prismarine-registry')(supportedVersion)
   const version = registry.version
   const Chunk = require('prismarine-chunk')(supportedVersion)
   const Item = require('prismarine-item')(registry)
+
+  // what every tick writes, whatever else the bot does
+  const TICK_PACKETS = ['tick_end', 'position', 'position_look', 'look', 'flying', 'player_input', 'pong']
 
   const hasSignedChat = registry.supportFeature('signedChat')
   function chatText (text) {
@@ -463,7 +467,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
           bot.on('physicsTick', count)
           await sleep(500)
           bot.off('physicsTick', count)
-          // 10 ticks at 20 tps plus one burst of at most maxCatchupTicks (4).
+          // 10 ticks at 20 tps plus one burst of at most maxCatchupTicks (2).
           assert.ok(ticks <= 18, `${ticks} physics ticks in the 500 ms after a 1.5 s stall`)
           assert.ok(ticks >= 8, `only ${ticks} physics ticks in 500 ms`)
           done()
@@ -486,6 +490,8 @@ for (const supportedVersion of mineflayer.testedVersions) {
         })
         server.on('playerJoin', async (client) => {
           try {
+            await bot.test.pluginsLoaded
+            bot._respawnReplyDelayMs = 1500 // the default is 0 from 1.19 on
             await client.write('login', bot.test.generateLoginPacket())
             const chunk = bot.test.buildChunk()
             chunk.setBlockType(pos, goldId)
@@ -638,6 +644,8 @@ for (const supportedVersion of mineflayer.testedVersions) {
         const sent = []
         server.on('playerJoin', async (client) => {
           try {
+            await bot.test.pluginsLoaded
+            bot._respawnReplyDelayMs = 1500 // the default is 0 from 1.19 on
             const originalWrite = bot._client.write.bind(bot._client)
             bot._client.write = (name, params) => {
               if (movementPackets.includes(name)) sent.push(`${name} in ${bot._client.state}`)
@@ -1790,6 +1798,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
           const block = { position: vec3(1, 65, 1) }
           await bot.activateBlock(block, vec3(0, 1, 0))
           await bot.activateBlock(block, vec3(-1, 0, 0))
+          writes.splice(0, writes.length, ...writes.filter(w => !TICK_PACKETS.includes(w.name)))
           try {
             const scale = bot.supportFeature('blockPlaceHasHandAndFloatCursor') || bot.supportFeature('blockPlaceHasInsideBlock') ? 1 : 16
             assert.deepStrictEqual(writes.map(w => w.name), ['block_place', 'arm_animation', 'block_place', 'arm_animation'])
@@ -1970,15 +1979,18 @@ for (const supportedVersion of mineflayer.testedVersions) {
         const writes = []
         bot._client.write = (name, params) => { writes.push({ name, params }) }
         bot._nextSequence() // vanilla numbers predicted actions only: the counter has moved on, swap hands stays 0
-        bot.vanilla.swapHands()
-        assert.strictEqual(writes.length, 1)
-        assert.strictEqual(writes[0].name, 'block_dig')
-        assert.strictEqual(writes[0].params.status, 6)
-        if (hasSequenceField()) assert.strictEqual(writes[0].params.sequence, 0)
+        const swapped = bot.vanilla.swapHands()
+        assert.strictEqual(writes.filter(w => w.name === 'block_dig').length, 0, 'the swap waits for the next tick')
+        await swapped
+        const dig = writes.filter(w => w.name === 'block_dig')
+        assert.strictEqual(dig.length, 1)
+        assert.strictEqual(dig[0].params.status, 6)
+        if (hasSequenceField()) assert.strictEqual(dig[0].params.sequence, 0)
       })
 
       it('offhandFromHotbar selects the slot, swaps hands and selects the previous slot again', async function () {
-        if (bot.supportFeature('doesntHaveOffHandSlot')) return this.skip()
+        // the offhand predates the totem in the data (1.9 - 1.11.2)
+        if (bot.supportFeature('doesntHaveOffHandSlot') || !registry.itemsByName.totem_of_undying) return this.skip()
         server.on('playerJoin', (client) => client.write('login', bot.test.generateLoginPacket()))
         await once(bot, 'login')
         await bot.test.pluginsLoaded
@@ -1986,7 +1998,6 @@ for (const supportedVersion of mineflayer.testedVersions) {
         bot.inventory.updateSlot(bot.QUICK_BAR_START + 3, new Item(registry.itemsByName.totem_of_undying.id, 1))
         const writes = []
         bot._client.write = (name, params) => { writes.push({ name, params }) }
-        bot.waitForTicks = async () => {} // no world, so no physics ticks
         const found = await bot.vanilla.offhandFromHotbar(item => item.name === 'totem_of_undying')
         const relevant = writes.filter(w => ['held_item_slot', 'block_dig'].includes(w.name))
         assert.strictEqual(found, true)
@@ -2009,15 +2020,24 @@ for (const supportedVersion of mineflayer.testedVersions) {
           const writes = []
           bot._client.write = (name, params) => { writes.push(name) }
           bot.quickBarSlot = 0
-          bot.activateItem()
-          bot.activateItem(true)
           try {
-            assert.deepStrictEqual(writes, [])
+            await bot.activateItem()
+            await bot.activateItem(true)
+            const sent = () => writes.filter(name => !TICK_PACKETS.includes(name))
+            assert.deepStrictEqual(sent(), [])
             assert.strictEqual(bot.usingHeldItem, false)
             bot.inventory.updateSlot(bot.QUICK_BAR_START, new Item(registry.itemsByName.stone.id, 1))
-            bot.activateItem()
-            assert.deepStrictEqual(writes, [bot.supportFeature('useItemWithOwnPacket') ? 'use_item' : 'block_place'])
+            await bot.activateItem()
+            assert.deepStrictEqual(sent(), [bot.supportFeature('useItemWithOwnPacket') ? 'use_item' : 'block_place'])
+            assert.strictEqual(bot.usingHeldItem, false, 'a block is not an item that is used up')
+            // food starts a use when the bot is hungry; the use is tracked until it is released
+            bot.food = 10
+            bot.inventory.updateSlot(bot.QUICK_BAR_START, new Item(registry.itemsByName.bread.id, 1))
+            await bot.activateItem()
             assert.strictEqual(bot.usingHeldItem, true)
+            assert.strictEqual(bot.itemInUse, true)
+            await bot.deactivateItem()
+            assert.strictEqual(bot.usingHeldItem, false)
             done()
           } catch (err) {
             done(err)
@@ -2159,7 +2179,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
           bot.inventory.updateSlot(bot.QUICK_BAR_START, new Item(registry.itemsByName.stone.id, 1))
           await bot._genericPlace({ position: vec3(1, 65, 1) }, vec3(0, 1, 0), { forceLook: 'ignore', swingArm: 'right' })
           try {
-            assert.deepStrictEqual(writes, ['block_place', 'arm_animation'])
+            assert.deepStrictEqual(writes.filter(name => !TICK_PACKETS.includes(name)), ['block_place', 'arm_animation'])
             done()
           } catch (err) {
             done(err)
@@ -2418,13 +2438,13 @@ for (const supportedVersion of mineflayer.testedVersions) {
           bot.quickBarSlot = 0
           bot.inventory.updateSlot(bot.QUICK_BAR_START, new Item(registry.itemsByName.stone.id, 1))
 
-          bot.activateItem()
-          bot.deactivateItem()
+          await bot.activateItem()
+          await bot.deactivateItem()
           await bot._genericPlace({ position: vec3(1, 65, 1) }, vec3(0, 1, 0), { forceLook: 'ignore' })
-          bot.activateItem()
+          await bot.activateItem()
 
           try {
-            assert.deepStrictEqual(writes, [
+            assert.deepStrictEqual(writes.filter(([name]) => !TICK_PACKETS.includes(name)), [
               ['use_item', 1],
               ['block_dig', 0],
               ['block_place', 2],
@@ -2461,15 +2481,17 @@ for (const supportedVersion of mineflayer.testedVersions) {
           bot.inventory.updateSlot(bot.QUICK_BAR_START, new Item(boat.id, 1))
 
           try {
-            bot.activateItem()
-            bot.deactivateItem()
+            await bot.activateItem()
+            await bot.deactivateItem()
             const placed = bot.placeEntity({ position: vec3(1, 64, 1) }, vec3(0, 1, 0))
-            await sleep(0)
+            // the click and the use_item that goes with it leave in one tick
+            while (!writes.some(([name, sequence]) => name === 'use_item' && sequence === 3)) await sleep(10)
+            await sleep(10)
             bot.emit('entitySpawn', { name: bot.supportFeature('entityNameUpperCaseNoUnderscore') ? 'Boat' : 'boat', position: vec3(1.5, 65, 1.5) })
             await placed
-            bot.activateItem()
+            await bot.activateItem()
 
-            assert.deepStrictEqual(writes.filter(([name]) => name !== 'arm_animation'), [
+            assert.deepStrictEqual(writes.filter(([name]) => name !== 'arm_animation' && !TICK_PACKETS.includes(name)), [
               ['use_item', 1],
               ['block_dig', 0],
               ['block_place', 2],
@@ -2762,11 +2784,36 @@ for (const supportedVersion of mineflayer.testedVersions) {
               bot._client.emit('position', { ...teleport, yaw: 30, teleportId: 1 })
               bot._client.emit('player_rotation', { yaw: 90, pitch: 0 })
               await once(bot, 'forcedMove')
-              assert.deepStrictEqual(replies, [30], 'the teleport is answered with its own rotation')
+              // the first position_look is the answer, the tick's own movement packet may follow it with the newer rotation
+              assert.strictEqual(replies[0], 30, 'the teleport is answered with its own rotation')
               assert.strictEqual(bot.entity.yaw, require('../lib/conversions').fromNotchianYaw(90), 'the later rotation wins')
             } finally {
               bot._client.write = write
             }
+            done()
+          } catch (err) {
+            done(err)
+          }
+        })
+      })
+
+      it('answers the teleport after a death at once on 1.19+: a late answer is an ignored teleport to Grim', function (done) {
+        if (registry.version['<']('1.19')) return this.skip()
+        server.on('playerJoin', async (client) => {
+          try {
+            await bot.test.pluginsLoaded
+            client.write('login', bot.test.generateLoginPacket())
+            const chunk = bot.test.buildChunk()
+            chunk.setBlockType(vec3(1, 65, 1), registry.blocksByName.stone.id)
+            client.write('map_chunk', generateChunkPacket(chunk))
+            await once(bot, 'chunkColumnLoad')
+            const teleport = { x: 1.5, y: 80, z: 1.5, dx: 0, dy: 0, dz: 0, pitch: 0, yaw: 0, flags: bot.supportFeature('positionPacketHasBitflags') ? {} : 0, teleportId: 0 }
+            client.write('position', teleport)
+            await once(bot, 'forcedMove')
+            bot.emit('death')
+            const answered = once(bot, 'forcedMove', 400)
+            bot._client.emit('position', { ...teleport, y: 90, teleportId: 1 })
+            await answered
             done()
           } catch (err) {
             done(err)
@@ -2868,6 +2915,321 @@ for (const supportedVersion of mineflayer.testedVersions) {
             done(err)
           }
         })
+      })
+    })
+
+    // The packets the bot writes, checked against the order rules of the Grim anticheat (test/grimLint.js). Clients
+    // from 1.21.2 on only: they end every tick with tick_end, which is what Grim's windows are built on.
+    describe('grimLint', function () {
+      this.timeout(30 * 1000)
+      const hasTickEnd = registry.supportFeature('sendsClientTickEndPacket')
+      const hasRotationPacket = registry.version['>=']('1.21.3')
+      const chestPos = vec3(1, 65, 2)
+      const names = (list) => list.map(p => p.name)
+      let client, lint, received
+
+      // A stone floor at y = 64, a chest at (1, 65, 2), the bot standing at (1.5, 65, 4.5)
+      async function join (onBlockPlace) {
+        const chunk = bot.test.buildChunk()
+        for (let x = 0; x < 16; x++) for (let z = 0; z < 16; z++) chunk.setBlockType(vec3(x, 64, z), registry.blocksByName.stone.id)
+        chunk.setBlockType(chestPos, registry.blocksByName.chest.id)
+        received = []
+        await new Promise(resolve => {
+          server.on('playerJoin', async (c) => {
+            client = c
+            await bot.test.pluginsLoaded
+            client.on('packet', (data, meta) => {
+              received.push({ name: meta.name, data })
+              if (meta.name === 'block_place' && onBlockPlace) onBlockPlace(client, data)
+            })
+            client.write('login', bot.test.generateLoginPacket())
+            client.write('map_chunk', generateChunkPacket(chunk))
+            client.write('position', { x: 1.5, y: 65, z: 4.5, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: bot.registry.version['>=']('1.21.3') ? {} : 0, teleportId: 0 })
+            client.write('update_health', { health: 20, food: 20, foodSaturation: 5 })
+            await once(bot, 'chunkColumnLoad')
+            await sleep(400) // lands on the floor
+            resolve()
+          })
+        })
+        bot.quickBarSlot = 0
+        lint = grimLint(bot)
+        received.length = 0
+      }
+
+      function flow (name, body) {
+        it(name, async function () {
+          if (!hasTickEnd) return this.skip()
+          await join()
+          await body.call(this)
+          assert.deepStrictEqual(lint.violations, [])
+        })
+      }
+      const give = (slot, name, count = 1) => bot.inventory.updateSlot(bot.QUICK_BAR_START + slot, new Item(registry.itemsByName[name].id, count))
+
+      flow('walking: the keys are reported once per tick when they change, a tapped jump included', async () => {
+        bot.setControlState('forward', true)
+        await bot.waitForTicks(4)
+        bot.setControlState('jump', true)
+        bot.setControlState('jump', false) // released before the tick: the jump still counts
+        await bot.waitForTicks(3)
+        bot.clearControlStates()
+        await bot.waitForTicks(3)
+        const inputs = received.filter(p => p.name === 'player_input').map(p => p.data.inputs)
+        // forward, forward + the tapped jump, forward again, nothing
+        assert.deepStrictEqual(inputs.map(i => [i.forward, i.jump]), [[true, false], [true, true], [true, false], [false, false]])
+      })
+
+      flow('sprint and sneak: state, not events (once per tick, sneak first, vanilla stop rules)', async () => {
+        bot.food = 20
+        bot.setControlState('sprint', true) // no forward input yet: nothing starts
+        await bot.waitForTicks(2)
+        assert.strictEqual(received.filter(p => p.name === 'entity_action').length, 0)
+        bot.setControlState('forward', true)
+        await bot.waitForTicks(3)
+        assert.strictEqual(bot.sprinting, true)
+        // toggling inside one tick reports nothing: the state did not change
+        bot.setControlState('sprint', false)
+        bot.setControlState('sprint', true)
+        bot.setControlState('sneak', true) // sneaking stops the sprint
+        await bot.waitForTicks(3)
+        assert.strictEqual(bot.sprinting, false)
+        bot.setControlState('sneak', false)
+        bot.food = 6 // too hungry to start
+        await bot.waitForTicks(3)
+        assert.strictEqual(bot.sprinting, false)
+        bot.food = 20
+        await bot.waitForTicks(3)
+        assert.strictEqual(bot.sprinting, true)
+        bot.setControlState('forward', false) // no forward input: stops
+        await bot.waitForTicks(3)
+        assert.strictEqual(bot.sprinting, false)
+        bot.clearControlStates()
+        await bot.waitForTicks(2)
+        const actions = received.filter(p => p.name === 'entity_action').map(p => p.data.actionId)
+        const sneakByAction = registry.version['<']('1.21.6')
+        assert.deepStrictEqual(actions, sneakByAction
+          ? ['start_sprinting', 'start_sneaking', 'stop_sprinting', 'stop_sneaking', 'start_sprinting', 'stop_sprinting']
+          : ['start_sprinting', 'stop_sprinting', 'start_sprinting', 'stop_sprinting'])
+      })
+
+      flow('sprinting forward with the wall flag raised stays clean', async () => {
+        bot.food = 20
+        bot.setControlState('forward', true)
+        bot.setControlState('sprint', true)
+        await bot.waitForTicks(2)
+        bot.entity.isCollidedHorizontally = true
+        bot.entity.position.z = 4.5 // pushed back where it was, against nothing: the engine decides the contact
+        await bot.waitForTicks(6)
+        bot.clearControlStates()
+        await bot.waitForTicks(2)
+      })
+
+      flow('eating: the use_item carries the rotation of the tick, the use is tracked until released', async () => {
+        bot.food = 10
+        give(0, 'bread', 3)
+        bot.look(2.0, -0.2) // in flight when the item is used
+        const eating = bot.activateItem()
+        assert.strictEqual(bot.itemInUse, false, 'nothing is written before the tick')
+        await eating
+        assert.strictEqual(bot.itemInUse, true)
+        assert.strictEqual(bot.usingHeldItem, true)
+        // not even an entity_status of another entity ends it
+        bot._client.emit('entity_status', { entityId: bot.entity.id + 1, entityStatus: 9 })
+        assert.strictEqual(bot.itemInUse, true)
+        await bot.waitForTicks(2)
+        await bot.deactivateItem()
+        assert.strictEqual(bot.itemInUse, false)
+        const use = received.find(p => p.name === 'use_item')
+        assert.ok(use, 'no use_item')
+        const { toNotchianYaw, toNotchianPitch } = require('../lib/conversions')
+        if (use.data.rotation) {
+          assert.ok(Math.abs(use.data.rotation.x - toNotchianYaw(2.0)) < 0.2)
+          assert.ok(Math.abs(use.data.rotation.y - toNotchianPitch(-0.2)) < 0.2)
+        }
+        bot._client.emit('entity_status', { entityId: bot.entity.id, entityStatus: 9 }) // used up
+        bot.food = 10
+        await bot.activateItem()
+        assert.strictEqual(bot.itemInUse, true)
+        bot._client.emit('entity_status', { entityId: bot.entity.id, entityStatus: 9 })
+        assert.strictEqual(bot.itemInUse, false)
+        await bot.activateItem()
+        bot.setQuickBarSlot(1) // another slot in hand
+        assert.strictEqual(bot.itemInUse, false)
+      })
+
+      flow('one action per tick: attack, use, swap, drop-in swing and held slot queued together', async () => {
+        const Entity = require('prismarine-entity')(bot.version)
+        const target = new Entity(77)
+        target.position = vec3(1.5, 65, 1.5)
+        bot.entities[77] = target
+        give(0, 'bread')
+        give(1, 'stone')
+        const queued = [
+          bot.attack(target),
+          bot.activateItem(),
+          bot.useOn(target),
+          bot.deactivateItem(),
+          bot.swingArm(),
+          bot.swingArm(),
+          bot.setQuickBarSlot(1)
+        ]
+        if (!bot.supportFeature('doesntHaveOffHandSlot')) queued.push(bot.vanilla.swapHands())
+        await Promise.all(queued)
+        const out = names(received).filter(n => !TICK_PACKETS.includes(n))
+        // the held slot leaves first, then one action per tick with the swap ahead of it
+        assert.strictEqual(out[0], 'held_item_slot')
+        assert.ok(out.includes('arm_animation'))
+      })
+
+      flow('placing and breaking: the click, the swing and the dig packets stay inside their ticks', async () => {
+        give(0, 'stone', 5)
+        await bot._genericPlace({ position: vec3(1, 64, 2) }, vec3(0, 1, 0), { forceLook: 'ignore', swingArm: 'right' })
+        await bot._genericPlace({ position: vec3(1, 64, 3) }, vec3(0, 1, 0), { forceLook: 'ignore', swingArm: 'right' })
+        await bot.activateBlock({ position: vec3(1, 64, 2) }, vec3(0, 1, 0))
+        bot.game.gameMode = 'creative'
+        await bot.dig(bot.blockAt(vec3(1, 64, 3)))
+        await bot.waitForTicks(2)
+        const out = names(received)
+        assert.ok(out.filter(n => n === 'block_place').length === 3)
+        assert.ok(out.includes('block_dig'))
+      })
+
+      flow('a window: opened with a click, clicked and closed only once the movement keys are released', async function () {
+        // the server answers the click with a chest window
+        const pWindows = require('prismarine-windows')(supportedVersion)
+        const chestData = pWindows.windows['minecraft:generic_9x3'] ?? { type: 'minecraft:chest', slots: 63 }
+        client.on('packet', (data, meta) => {
+          if (meta.name !== 'block_place') return
+          client.write('open_window', { windowId: 1, inventoryType: chestData.type, windowTitle: chatText(''), slotCount: chestData.slots - 36, entityId: 0 })
+          client.write('window_items', { windowId: 1, stateId: 1, items: Array.from({ length: chestData.slots }, () => Item.toNotch(null)), carriedItem: Item.toNotch(null) })
+        })
+        const window = await bot.vanilla.openContainer(bot.blockAt(chestPos))
+        bot.setControlState('forward', true)
+        await bot.waitForTicks(3)
+        received.length = 0
+        const closing = window.close()
+        let closed = false
+        closing.then(() => { closed = true })
+        await bot.waitForTicks(2)
+        assert.strictEqual(closed, false, 'the window stays open while a key is held')
+        assert.ok(!names(received).includes('close_window'))
+        bot.setControlState('forward', false)
+        await closing
+        await sleep(100)
+        const order = names(received).filter(n => n === 'player_input' || n === 'close_window')
+        assert.deepStrictEqual(order, ['player_input', 'close_window'], 'the zero input is out before the close')
+        assert.strictEqual(received.filter(p => p.name === 'player_input').pop().data.inputs.forward, false)
+        // and a click waits the same way
+        bot.setControlState('forward', true)
+        await bot.waitForTicks(2)
+        received.length = 0
+        const clicking = bot.clickWindow(5, 0, 0).catch(() => {})
+        bot.setControlState('forward', false)
+        await clicking
+        const clickOrder = names(received).filter(n => n === 'player_input' || n === 'window_click')
+        assert.ok(clickOrder.indexOf('player_input') < clickOrder.indexOf('window_click') || !clickOrder.includes('window_click'))
+      })
+
+      flow('a teleport and a server rotation are answered like the vanilla client does', async () => {
+        const teleport = { x: 3.5, y: 65, z: 4.5, dx: 0, dy: 0, dz: 0, yaw: 30, pitch: 5, flags: bot.registry.version['>=']('1.21.3') ? {} : 0, teleportId: 1 }
+        received.length = 0
+        client.write('position', teleport)
+        await once(bot, 'forcedMove')
+        await bot.waitForTicks(2)
+        const reply = received.find(p => p.name === 'position_look')
+        assert.ok(reply)
+        assert.strictEqual(reply.data.x, 3.5)
+        assert.strictEqual(reply.data.yaw, 30)
+        const confirm = names(received).indexOf('teleport_confirm')
+        assert.ok(confirm >= 0 && confirm < names(received).indexOf('position_look'))
+        // the bot kept the ground it stands on: the next steps use ground acceleration (keep-ground)
+        assert.strictEqual(bot.entity.onGround, true)
+        if (!hasRotationPacket) return
+        received.length = 0
+        client.write('player_rotation', { yaw: 90, pitch: 10, ...(registry.version['>=']('26.1') ? { relativeYaw: false, relativePitch: false } : {}) })
+        await bot.waitForTicks(3)
+        const rot = received.find(p => p.name === 'look' || p.name === 'position_look')
+        assert.ok(rot, 'the server rotation is answered')
+        assert.strictEqual(rot.data.yaw, 90)
+        assert.strictEqual(rot.data.pitch, 10)
+        assert.deepStrictEqual([rot.data.flags.onGround, rot.data.flags.hasHorizontalCollision], [false, false])
+      })
+
+      flow('a respawn starts again from nothing sent', async () => {
+        const loginPacket = bot.test.generateLoginPacket()
+        loginPacket.worldName = 'minecraft:overworld'
+        bot.food = 20
+        bot.setControlState('forward', true)
+        bot.setControlState('sprint', true)
+        await bot.waitForTicks(3)
+        assert.strictEqual(bot.sprinting, true)
+        received.length = 0
+        bot.emit('death')
+        bot.emit('respawn')
+        client.write('position', { x: 1.5, y: 65, z: 4.5, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: bot.registry.version['>=']('1.21.3') ? {} : 0, teleportId: 7 })
+        await once(bot, 'forcedMove')
+        await bot.waitForTicks(3)
+        const out = received.filter(p => ['player_input', 'entity_action'].includes(p.name)).map(p => p.name === 'entity_action' ? p.data.actionId : 'player_input')
+        assert.deepStrictEqual(out, ['player_input', 'start_sprinting'], 'the keys held across the respawn are reported again')
+        bot.clearControlStates()
+        await bot.waitForTicks(2)
+      })
+
+      flow('looking: the pitch stays within +-90 degrees, the yaw takes the short way, a forced look does not jump', async () => {
+        await assert.rejects(bot.look(NaN, 0), /finite/)
+        await assert.rejects(bot.lookAt(vec3(NaN, 65, 0)), /finite/)
+        const pitches = [Math.PI / 2, -Math.PI / 2, 1.5707, -1.5709, 3, -3, 0]
+        for (let i = 0; i < 60; i++) {
+          const yaw = (Math.random() - 0.5) * 30
+          const pitch = i < pitches.length ? pitches[i] : (Math.random() - 0.5) * 4
+          await bot.look(yaw, pitch, i % 2 === 0)
+          assert.ok(Math.abs(bot.entity.pitch) <= Math.PI / 2 + 1e-9, `pitch ${bot.entity.pitch}`)
+        }
+        for (const packet of received.filter(p => p.data.yaw !== undefined && p.data.pitch !== undefined)) {
+          assert.ok(Math.abs(packet.data.pitch) <= 90, `pitch ${packet.data.pitch}`)
+        }
+        // forcing over the wrap: 5.5 radians and then -0.5 are 0.28 radians apart
+        await bot.look(5.5, 0)
+        received.length = 0
+        await bot.look(-0.5, 0, true)
+        const yaws = received.filter(p => p.data.yaw !== undefined).map(p => p.data.yaw)
+        assert.ok(yaws.length >= 1)
+      })
+
+      flow('easing a turn keeps the packets and the simulation on the same rotation', async () => {
+        bot.physics.yawSpeed = 3 // rad/s: 8.6 degrees a tick
+        bot.physics.pitchSpeed = 3
+        try {
+          await bot.look(2.5, 0.3)
+          const yaws = received.filter(p => p.data.yaw !== undefined).map(p => p.data.yaw)
+          assert.ok(yaws.length >= 3, 'the turn takes several ticks')
+          for (let i = 1; i < yaws.length; i++) assert.ok(Math.abs(yaws[i] - yaws[i - 1]) <= 8.7, `${yaws[i - 1]} -> ${yaws[i]}`)
+        } finally {
+          bot.physics.yawSpeed = bot.physics.pitchSpeed = Infinity
+        }
+      })
+
+      flow('the hotbar selection leaves first in a tick, a server selection is echoed with the next tick', async () => {
+        give(0, 'bread')
+        give(1, 'stone')
+        received.length = 0
+        client.write('held_item_slot', { slot: 5 })
+        await bot.waitForTicks(3)
+        assert.deepStrictEqual(received.filter(p => p.name === 'held_item_slot').map(p => p.data.slotId), [5])
+        received.length = 0
+        const selected = bot.setQuickBarSlot(1)
+        const used = bot.activateItem()
+        await Promise.all([selected, used])
+        await sleep(100)
+        const out = names(received).filter(n => ['held_item_slot', 'use_item', 'block_place'].includes(n))
+        assert.deepStrictEqual(out, ['held_item_slot', registry.supportFeature('useItemWithOwnPacket') ? 'use_item' : 'block_place'])
+      })
+
+      flow('after a stall the ticks catch up by at most two', async () => {
+        const stallUntil = Date.now() + 600
+        while (Date.now() < stallUntil) { /* busy wait */ }
+        await sleep(1000)
+        assert.ok(lint.ticksPerSecond() <= 22, `${lint.ticksPerSecond()} ticks in a second`)
       })
     })
 
