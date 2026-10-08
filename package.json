@@ -10,6 +10,7 @@
     "pretest": "npm run lint",
     "lint": "standard && standard-markdown",
     "fix": "standard --fix && standard-markdown --fix",
+    "bench": "node bench/run.js",
     "prepublishOnly": "true"
   },
   "repository": {
