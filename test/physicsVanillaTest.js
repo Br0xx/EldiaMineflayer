@@ -621,6 +621,145 @@ describe('9bflayer physics', function () {
     }
   })
 
+  describe('the supporting block decides friction, speed and jump factors (1.20+)', () => {
+    const ICE_Y = FLOOR_Y - 1 // the layer whose top is the floor
+    // vanilla: 0.1F * (0.21600002F / (0.98F ^ 3)), times the 0.98 of the key
+    const iceStep = F(F(0.1) * F(F(0.21600002) / F(F(F(0.98) * F(0.98)) * F(0.98)))) * F(0.98)
+
+    // one ice block at x 0..1, z 0..1; the floor on the other side of x = 1 is cut away below the box, so that a
+    // centre past the edge has air under it; `rest` is what the cut layer is refilled with (nothing by default)
+    function iceEdge (version, rest) {
+      return setup(version, w => {
+        for (let x = 1; x <= 60; x++) for (let z = -30; z <= 30; z++) w.blocks.delete(`${x},${ICE_Y},${z}`)
+        for (let x = -30; x <= 0; x++) for (let z = -30; z <= 30; z++) w.blocks.delete(`${x},${ICE_Y},${z}`)
+        w.set(0, ICE_Y, 0, 'ice')
+        if (rest) rest(w)
+      })
+    }
+    // a tick without input first, as a bot that has been standing there: vanilla finds the supporting block at the end
+    // of a move, and the friction of the next tick reads it
+    function walkOneTick (physics, world, x, z = 0.5) {
+      const e = makeEntity(x, FLOOR_Y, z)
+      physics.simulatePlayer(e, world)
+      e.control.forward = true
+      const before = e.pos.x
+      physics.simulatePlayer(e, world)
+      return { e, dx: e.pos.x - before }
+    }
+
+    for (const version of ['1.21.4', '26.2', '1.20.4']) {
+      it(`${version}: centre past the ice edge, box still on it: ice friction (0.0225), not stone's (0.098)`, () => {
+        const { physics, world } = iceEdge(version)
+        const inside = walkOneTick(physics, world, 0.5)
+        const edge = walkOneTick(physics, world, 1.2)
+        assert.deepStrictEqual({ ...edge.e.supportingBlock }, { x: 0, y: ICE_Y, z: 0 })
+        assert.ok(edge.dx < 0.03, `dx ${edge.dx}`)
+        roughly(edge.dx, inside.dx, 1e-9, 'same as standing in the middle of the ice')
+        if (version !== '1.20.4') roughly(edge.dx, iceStep, 1e-6, 'vanilla ice step 0.02249')
+      })
+
+      it(`${version}: the box off the ice altogether is plain stone friction again`, () => {
+        const { physics, world } = iceEdge(version, w => w.set(1, ICE_Y, 0, 'stone'))
+        const { e, dx } = walkOneTick(physics, world, 1.6) // box 1.3..1.9: on the stone at x = 1
+        assert.deepStrictEqual({ ...e.supportingBlock }, { x: 1, y: ICE_Y, z: 0 })
+        roughly(dx, 0.098, 1e-3)
+      })
+
+      it(`${version}: straddling ice and stone, the block closest to the centre is the one stood on`, () => {
+        const { physics, world } = iceEdge(version, w => w.fill(1, ICE_Y, -30, 60, ICE_Y, 30, 'stone'))
+        const onIce = walkOneTick(physics, world, 0.9) // ice centre 0.4 away, stone 0.6
+        assert.deepStrictEqual({ ...onIce.e.supportingBlock }, { x: 0, y: ICE_Y, z: 0 })
+        assert.ok(onIce.dx < 0.03, `ice dx ${onIce.dx}`)
+        const onStone = walkOneTick(physics, world, 1.1) // stone 0.4 away, ice 0.6: the old code read the stone too
+        assert.deepStrictEqual({ ...onStone.e.supportingBlock }, { x: 1, y: ICE_Y, z: 0 })
+        roughly(onStone.dx, 0.098, 1e-3)
+        // the centre over stone but the box still touching ice: stone wins (closer), same as the centre column
+        const flush = walkOneTick(physics, world, 1.04)
+        roughly(flush.dx, 0.098, 1e-3)
+      })
+    }
+
+    it('soul sand: the 0.4 factor holds with the centre past the edge', () => {
+      for (const version of ['1.21.4', '1.20.4']) {
+        const { physics, world } = setup(version, w => w.set(0, FLOOR_Y, 0, 'soul_sand', SOUL_SAND))
+        const e = makeEntity(1.2, FLOOR_Y + 0.875, 0.5) // box 0.9..1.5: on the soul sand by 0.1
+        physics.simulatePlayer(e, world)
+        e.control.forward = true
+        physics.simulatePlayer(e, world)
+        // 0.098 of speed, * F(0.4) block factor, * F(0.6F * 0.91F) friction (the air column does not matter)
+        roughly(e.vel.x, 0.098 * F(0.4) * F(F(0.6) * F(0.91)), 1e-6, version)
+      }
+    })
+
+    it('honey: the jump is halved from the edge, too (1.21.4)', () => {
+      const { physics, world } = iceEdge('1.21.4', w => w.set(0, ICE_Y, 0, 'honey_block'))
+      const e = makeEntity(1.2, FLOOR_Y)
+      physics.simulatePlayer(e, world)
+      e.control.jump = true
+      physics.simulatePlayer(e, world)
+      assert.strictEqual(e.pos.y - FLOOR_Y, F(F(0.42) * F(0.5)))
+    })
+
+    it('keeps the block when a fast move ends over nothing, once; a second such tick falls back to the centre', () => {
+      const { physics, world } = iceEdge('1.21.4')
+      const e = makeEntity(0.9, FLOOR_Y)
+      physics.simulatePlayer(e, world)
+      e.vel.x = 0.7 // box 1.3..1.9 at the end of the move: the slab is empty, the box one move back is on the ice
+      physics.simulatePlayer(e, world)
+      assert.strictEqual(e.onGround, true)
+      assert.deepStrictEqual({ ...e.supportingBlock }, { x: 0, y: ICE_Y, z: 0 })
+      assert.strictEqual(e.supportNoBlocks, false)
+
+      const f = makeEntity(0.9, FLOOR_Y)
+      f.supportNoBlocks = true // the tick before was on the ground over nothing
+      f.vel.x = 0.7
+      physics.simulatePlayer(f, world)
+      assert.strictEqual(f.onGround, true)
+      assert.strictEqual(f.supportingBlock, null)
+      assert.strictEqual(f.supportNoBlocks, true)
+    })
+
+    it('forgets the supporting block in the air', () => {
+      const { physics, world } = iceEdge('1.21.4')
+      const e = makeEntity(0.5, FLOOR_Y)
+      physics.simulatePlayer(e, world)
+      assert.ok(e.supportingBlock)
+      e.control.jump = true
+      physics.simulatePlayer(e, world)
+      assert.strictEqual(e.onGround, false)
+      assert.strictEqual(e.supportingBlock, null)
+      assert.strictEqual(e.supportNoBlocks, false)
+    })
+
+    it('PlayerState carries the supporting block from tick to tick', () => {
+      const { physics, world } = iceEdge('1.21.4')
+      const bot = fakeBot('1.21.4')
+      bot.entity.position = new Vec3(1.2, FLOOR_Y, 0.5)
+      bot.entity.yaw = EAST
+      bot.entity.velocity = new Vec3(0, -0.0784, 0)
+      const control = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false }
+      let state = new PlayerState(bot, control)
+      physics.simulatePlayer(state, world)
+      state.apply(bot)
+      assert.deepStrictEqual({ ...bot.entity.supportingBlock }, { x: 0, y: ICE_Y, z: 0 })
+      state = new PlayerState(bot, { ...control, forward: true })
+      assert.deepStrictEqual({ ...state.supportingBlock }, { x: 0, y: ICE_Y, z: 0 })
+      physics.simulatePlayer(state, world)
+      roughly(state.pos.x - 1.2, iceStep, 1e-6)
+    })
+
+    for (const version of ['1.8.8', '1.12.2', '1.19.4']) {
+      it(`${version} is unchanged: friction still comes from the block under the centre`, () => {
+        const { physics, world } = iceEdge(version)
+        const edge = walkOneTick(physics, world, 1.2)
+        assert.strictEqual(edge.e.supportingBlock, undefined, 'not tracked before 1.20')
+        roughly(edge.dx, 0.098, 1e-3, 'air under the centre: default friction')
+        const inside = walkOneTick(physics, world, 0.5)
+        assert.ok(inside.dx < 0.03, `ice under the centre ${inside.dx}`)
+      })
+    }
+  })
+
   describe('older versions keep the original code', () => {
     for (const version of ['1.8.8', '1.12.2', '1.16.5', '1.20.4']) {
       it(`${version} still walks 0.098 and jumps 0.42 on the float box`, () => {
