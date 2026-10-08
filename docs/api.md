@@ -86,6 +86,11 @@
       - [Particle.movementSpeed](#particlemovementspeed)
   - [Bot](#bot)
     - [mineflayer.createBot(options)](#mineflayercreatebotoptions)
+    - [mineflayer.createPersistentBot(options)](#mineflayercreatepersistentbotoptions)
+      - [Options](#options)
+      - [Events](#events)
+      - [Methods and properties](#methods-and-properties)
+      - [What it decides](#what-it-decides)
     - [Properties](#properties)
       - [bot.registry](#botregistry)
       - [bot.world](#botworld)
@@ -838,6 +843,88 @@ Create and return an instance of the class bot.
  * [particleStatus](#bot.settings.particleStatus)
  * chatLengthLimit : the maximum amount of characters that can be sent in a single message. If this is not set, it will be 100 in < 1.11 and 256 in >= 1.11.
  * defaultChatPatterns: defaults to true, set to false to not add the patterns such as chat and whisper
+ * watchdog : `false` or `{ enabled, silenceMs }`, defaults to `{ enabled: true, silenceMs: 90000 }`. Once logged in, a connection that receives no bytes for `silenceMs` is ended with reason `'watchdog'` (a dead TCP connection never errors; `read ETIMEDOUT` can take minutes to show). Emits `bot.on('watchdog', silentMs)` first. `bot.lastPacketAt` is the time of the last bytes. Keep `silenceMs` above `checkTimeoutInterval`.
+
+### mineflayer.createPersistentBot(options)
+
+Returns a `PersistentBot` (an EventEmitter) that keeps a bot on a server: it logs in, reconnects when the connection drops,
+and does it within a login budget. Meant for bots that stay for days on a server like 9b9t, behind TCPShield and a
+login queue: after ~20 logins an hour from one IP TCPShield starts dropping connections (`read ETIMEDOUT`) and new
+logins hang without spawning, and Xbox answers 429 when Microsoft logins come closer than ~15 s.
+
+```js
+const pb = mineflayer.createPersistentBot({
+  host: '9b9t.org',
+  username: 'Bot',
+  auth: 'microsoft',
+  version: '1.21.4',
+  reconnect: { store: mineflayer.fileStore('./logins.json', { key: 'Bot' }) }
+})
+pb.on('bot', bot => { bot.loadPlugin(pathfinder); bot.on('chat', console.log) }) // every new bot, before it connects
+pb.on('end', (reason, decision) => console.log(reason, decision.action, decision.at))
+pb.run(async bot => { /* rejects with code 'disconnected' if the bot ends */ }).catch(console.log)
+```
+
+#### Options
+
+`options` is everything `createBot` takes (except `client`), plus:
+
+ * onBot : `(bot) => void`, called with every new bot before it connects (the same as `pb.on('bot')`)
+ * reconnect : `false`, or an object (all optional):
+   - enabled : true
+   - baseDelayMs : 10000, the delay after the first failure; it doubles for each one (EBS's values)
+   - maxDelayMs : 300000
+   - jitter : 0.2, random spread of +-20% on every delay
+   - maxAttempts : 0, consecutive failed attempts before giving up (0 = never)
+   - loginBudget : `{ perHour: 6, perHostPerHour: 20, minSpacingMs, windowMs: 3600000 }`. `perHour` counts the logins of this bot (0 = unlimited). `perHostPerHour` counts the logins to one host:port from every PersistentBot in the process, because TCPShield counts per IP (0 = unlimited). `minSpacingMs` defaults to 15000 for `auth: 'microsoft'` and 0 otherwise, and is shared by every PersistentBot in the process: one scheduler, because Xbox rate-limits per IP and account.
+   - store : `{ load(), save(state) }` keeping the login timestamps (`{ logins: number[] }`) across process restarts, so a crash loop cannot spend the budget again. Default in memory; `mineflayer.fileStore(path, { key })` keeps them in a JSON file that several bots can share (one `key` each). The state is `{ logins, hosts: { 'host:port': timestamps } }`, so the host budget survives restarts too. Both calls are synchronous.
+   - loginTimeoutMs : 180000, how long a connection may take to spawn (sign-in time not counted: the clock starts after the Microsoft code is entered). The 9b9t queue can hold a login for minutes. A bot that hangs is ended and counts as a hung login, not as a kick.
+   - hungLoginLimit : 3, hung logins in a row after which it stops trying: every further attempt keeps the IP throttled. 0 = never. A spawn resets the count.
+   - hungLoginResumeMs : 3600000, after that stop, one new try this long later (state 'waiting', 'waiting' event with reason `'throttled'`). If that one hangs too it waits again, so it makes one try per hour instead of three in a row. `pb.stop()` ends it for good. 0 = stop for good with cause `'throttled'` ('stopped' is emitted).
+   - stableMs : 60000, how long a connection must stay up for the backoff to start over (a login that is kicked a second later does not reset it)
+   - longWaitMs : 300000, the hold-off for 'wait' decisions
+   - conflictLimit : 3, "already connected" kicks in a row before it assumes another session owns the account and stops
+   - transferDelayMs : 500, pause before following a transfer packet
+   - giveUpOn : list of strings (substring, case-insensitive) and RegExps, added to the built-in list (banned, not whitelisted, invalid session, account does not own Minecraft, outdated client), for kick texts that mean stop
+   - classify : `(reasonText, info) => 'retry' | 'wait' | 'stop' | undefined`, called first; anything else falls through to the built-in rules. `info` is `{ kicked, error, wasOnline, onlineMs, hung }`.
+
+#### Events
+
+ * 'bot' (bot) : a new bot, before it connects. Attach listeners and load plugins here.
+ * 'login' (bot), 'spawn' (bot) : forwarded from the bot (`'spawn'` fires on every respawn too)
+ * 'end' (reason, decision) : a connection ended. `reason` is the kick text, the error or the end reason. `decision` is `{ action: 'retry' | 'wait' | 'stop', cause, delayMs, at, blockedBy, endReason }`; `at` is when the next login starts (null for 'stop').
+ * 'reconnecting' ({ attempt, delayMs, at, reason }) : a retry is scheduled
+ * 'waiting' ({ until, delayMs, reason, loginsLastHour, perHour }) : something other than the backoff holds the next login back until `until`. `reason` is `'budget'` (this bot's `perHour`), `'hostBudget'` (the process-wide `perHostPerHour`; the counts are the host's) or `'throttled'` (waiting to resume after hung logins).
+ * 'transfer' ({ host, port }) : the server sent a transfer packet (1.20.5+). The keeper ends the connection and logs in to the target after `transferDelayMs`. This is a new TCP connection but not a new login: it is not counted in the budget, and three in a minute are treated as a redirect loop and wait `longWaitMs`. The next connection after the transferred one goes back to the configured host.
+ * 'msaCode' (data) : the Microsoft device-code prompt
+ * 'state' (state, previous)
+ * 'stopped' (reason, cause) : it will not log in again. `cause` is one of 'user' (the code called `bot.end()`/`bot.quit()`), 'stopped' (`pb.stop()`), 'give-up' (`giveUpOn`), 'classify', 'throttled' (only with `hungLoginResumeMs: 0`), 'conflict', 'max-attempts', 'reconnect-disabled'.
+ * 'error' (err) : errors of the inner bots. It is only emitted when there is a listener, so nothing crashes the process.
+
+#### Methods and properties
+
+ * pb.bot : the current mineflayer bot, replaced on every reconnect (null before the first)
+ * pb.state : 'connecting' (including waiting for a login slot and signing in), 'online' (after the first spawn), 'waiting' (a backoff or the budget) or 'stopped'
+ * pb.stats : `{ logins, attempts, kicks, hungLogins, hungLoginsInARow, transfers, loginsLastHour, lastError, lastKick, lastEnd, nextAttemptAt, onlineSince }`
+ * pb.whenOnline({ timeoutMs }) : a promise of the bot, resolved at once if it is online. Rejects with code 'stopped' or 'timeout'.
+ * pb.run(task, { wait = true }) : `await task(bot, signal)` against the current bot (waiting for it to be online first). Rejects with code 'disconnected' as soon as that bot ends, and aborts `signal` so the task can clean up.
+ * pb.stop(reason) : stops for good. Cancels a pending retry or login slot, destroys a socket that is still signing in, ends the bot. 'end' and then 'stopped' follow.
+ * pb.reconnectNow({ ignoreBudget }) : skips the wait and logs in now. The budget and the Microsoft spacing still apply unless `ignoreBudget` is set. Restarts a stopped bot. Returns false if a connection is already up or being made.
+
+#### What it decides
+
+| Disconnect | Decision |
+|---|---|
+| `bot.end()` / `bot.quit()` by your code | stop (`'user'`) |
+| banned, not whitelisted, invalid session, does not own the game, outdated client, `giveUpOn` | stop (`'give-up'`) |
+| "already connected" and the like | wait `longWaitMs`; stop after `conflictLimit` in a row |
+| server restarting or closed | wait `longWaitMs` |
+| HTTP 429 | wait `longWaitMs`, and no Microsoft login in this process starts before that |
+| full, queue, throttled, `ETIMEDOUT`, `ECONNRESET`, watchdog, any other kick | retry with the backoff |
+| no spawn within `loginTimeoutMs` | retry with the backoff; `hungLoginLimit` in a row wait `hungLoginResumeMs` for one more try (or stop, if that is 0) |
+| transfer | follow it after `transferDelayMs` |
+
+Whatever the decision, a login only starts when both budgets have room; otherwise 'waiting' tells you when the next slot opens. A restart that finds the budget spent (the store remembers) waits instead of logging in.
 
 ### Properties
 

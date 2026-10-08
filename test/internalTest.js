@@ -20,6 +20,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
   // what every tick writes, whatever else the bot does
   const TICK_PACKETS = ['tick_end', 'position', 'position_look', 'look', 'flying', 'player_input', 'pong']
 
+  const statusShift = version['>=']('26.3') ? 1 : 0 // see lib/player_action.js
   const hasSignedChat = registry.supportFeature('signedChat')
   function chatText (text) {
     // TODO: move this to prismarine-chat in a new ChatMessage(text).toNotch(asNbt) method
@@ -27,6 +28,15 @@ for (const supportedVersion of mineflayer.testedVersions) {
       ? nbt.comp({ text: nbt.string(text) })
       : JSON.stringify({ text })
   }
+
+  // 26.3 sends the light masks as a BitSet byte array, little-endian, where earlier versions send [msb, lsb] long pairs
+  const maskBytes = version['>=']('26.3')
+    ? longs => {
+      const out = Buffer.alloc(longs.length * 8)
+      longs.forEach(([msb, lsb], i) => { out.writeInt32LE(lsb, i * 8); out.writeInt32LE(msb, i * 8 + 4) })
+      return out
+    }
+    : longs => longs
 
   function generateChunkPacket (chunk) {
     const lights = chunk.dumpLight()
@@ -46,10 +56,10 @@ for (const supportedVersion of mineflayer.testedVersions) {
       chunkData: chunk.dump(),
       blockEntities: [],
       trustEdges: false,
-      skyLightMask: lights?.skyLightMask,
-      blockLightMask: lights?.blockLightMask,
-      emptySkyLightMask: lights?.emptySkyLightMask,
-      emptyBlockLightMask: lights?.emptyBlockLightMask,
+      skyLightMask: lights && maskBytes(lights.skyLightMask),
+      blockLightMask: lights && maskBytes(lights.blockLightMask),
+      emptySkyLightMask: lights && maskBytes(lights.emptySkyLightMask),
+      emptyBlockLightMask: lights && maskBytes(lights.emptyBlockLightMask),
       skyLight: lights?.skyLight,
       blockLight: lights?.blockLight
     }
@@ -1994,7 +2004,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
     })
 
     describe('swap hands', () => {
-      it('swapHands writes block_dig status 6 with sequence 0', async function () {
+      it('swapHands writes block_dig status SWAP_ITEM_WITH_OFFHAND (6, 7 on 26.3) with sequence 0', async function () {
         if (bot.supportFeature('doesntHaveOffHandSlot')) return this.skip()
         server.on('playerJoin', (client) => client.write('login', bot.test.generateLoginPacket()))
         await once(bot, 'login')
@@ -2007,7 +2017,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
         await swapped
         const dig = writes.filter(w => w.name === 'block_dig')
         assert.strictEqual(dig.length, 1)
-        assert.strictEqual(dig[0].params.status, 6)
+        assert.strictEqual(dig[0].params.status, 6 + statusShift)
         if (hasSequenceField()) assert.strictEqual(dig[0].params.sequence, 0)
       })
 
@@ -2024,13 +2034,594 @@ for (const supportedVersion of mineflayer.testedVersions) {
         const found = await bot.vanilla.offhandFromHotbar(item => item.name === 'totem_of_undying')
         const relevant = writes.filter(w => ['held_item_slot', 'block_dig'].includes(w.name))
         assert.strictEqual(found, true)
-        assert.deepStrictEqual(relevant.map(w => [w.name, w.params.slotId ?? w.params.status]), [['held_item_slot', 3], ['block_dig', 6], ['held_item_slot', 0]])
+        assert.deepStrictEqual(relevant.map(w => [w.name, w.params.slotId ?? w.params.status]), [['held_item_slot', 3], ['block_dig', 6 + statusShift], ['held_item_slot', 0]])
         assert.strictEqual(await bot.vanilla.offhandFromHotbar(item => item.name === 'diamond'), false)
       })
 
       function hasSequenceField () {
         return registry.version['>=']('1.19')
       }
+    })
+
+    describe('chunks of the newest versions', () => {
+      // 1.18+ sections written by hand from the wire format, not by prismarine-chunk: 26.2 and 26.3 have no chunk
+      // class of their own (lib/mcdata/overlay.js lends them pc/1.18), and 26.3 has more block states than 15 bits
+      const hasChunkFormat = registry.version['>=']('1.18')
+      const sizePrefixed = registry.version['<']('1.21.5') // the paletted container's data array carries its length
+      const fluidCounted = registry.version['>=']('26.1') // each section starts with a block count and a fluid count
+      const maxState = registry.blocksArray.reduce((m, b) => Math.max(m, b.maxStateId), 0)
+      const directBits = Math.ceil(Math.log2(maxState + 1)) // vanilla: ceillog2 of the block state registry size
+      const lastBlock = registry.blocksArray[registry.blocksArray.length - 1]
+      const topStateBlock = registry.blocksArray.find(b => b.maxStateId === maxState)
+      const minY = -64
+      const sections = 24
+
+      const varint = (n) => {
+        const out = []
+        do {
+          let b = n & 0x7f
+          n >>>= 7
+          if (n) b |= 0x80
+          out.push(b)
+        } while (n)
+        return Buffer.from(out)
+      }
+      // values packed without spanning longs: floor(64 / bits) per long, first value in the low bits
+      function packed (values, bits) {
+        const perLong = Math.floor(64 / bits)
+        const out = Buffer.alloc(Math.ceil(values.length / perLong) * 8)
+        values.forEach((value, i) => {
+          const at = Math.floor(i / perLong) * 8
+          out.writeBigUInt64BE(out.readBigUInt64BE(at) | (BigInt(value) << BigInt((i % perLong) * bits)), at)
+        })
+        return Buffer.concat([sizePrefixed ? varint(out.length / 8) : Buffer.alloc(0), out])
+      }
+      // One section from 4096 block state ids (index = y * 256 + z * 16 + x), with a single-value biome container
+      function section (states) {
+        const nonAir = states.filter(s => s !== 0).length
+        const head = Buffer.alloc(fluidCounted ? 4 : 2)
+        head.writeInt16BE(nonAir)
+        const unique = [...new Set(states)]
+        let blocks
+        if (unique.length === 1) {
+          blocks = Buffer.concat([Buffer.from([0]), varint(unique[0]), sizePrefixed ? varint(0) : Buffer.alloc(0)])
+        } else if (unique.length <= 256) {
+          const bits = Math.max(4, Math.ceil(Math.log2(unique.length)))
+          blocks = Buffer.concat([Buffer.from([bits]), varint(unique.length), ...unique.map(varint), packed(states.map(s => unique.indexOf(s)), bits)])
+        } else {
+          blocks = Buffer.concat([Buffer.from([directBits]), packed(states, directBits)])
+        }
+        const biomes = Buffer.concat([Buffer.from([0]), varint(0), sizePrefixed ? varint(0) : Buffer.alloc(0)])
+        return Buffer.concat([head, blocks, biomes])
+      }
+      const index = (x, y, z) => y * 256 + z * 16 + x
+
+      // what the world holds: a few states in section 4, every state kind in section 5, stone in section 6
+      const spots = [
+        [vec3(1, 2, 3), lastBlock.defaultState],
+        [vec3(15, 15, 15), maxState],
+        [vec3(0, 0, 0), registry.blocksByName.stone.defaultState],
+        [vec3(7, 8, 9), registry.blocksByName.dirt.defaultState]
+      ]
+      const mixed = Array.from({ length: 4096 }, (_, i) => (i * 37 + 11) % (maxState + 1))
+      mixed[100] = maxState
+      mixed[4000] = lastBlock.maxStateId
+      const few = new Array(4096).fill(0)
+      for (const [p, state] of spots) few[index(p.x, p.y, p.z)] = state
+      const stone = new Array(4096).fill(registry.blocksByName.stone.defaultState)
+      const air = new Array(4096).fill(0)
+      const world = Array.from({ length: sections }, (_, i) => i === 4 ? few : i === 5 ? mixed : i === 6 ? stone : air)
+
+      const emptyMask = version['>=']('26.3') ? Buffer.alloc(0) : []
+      async function join (chunkPacket) {
+        await new Promise(resolve => {
+          server.on('playerJoin', async (client) => {
+            await bot.test.pluginsLoaded
+            client.write('login', bot.test.generateLoginPacket())
+            client.write('map_chunk', chunkPacket)
+            await once(bot, 'chunkColumnLoad')
+            resolve()
+          })
+        })
+      }
+      const rawChunk = (chunkData, rest) => ({
+        x: 0,
+        z: 0,
+        heightmaps: { type: 'compound', name: '', value: { MOTION_BLOCKING: { type: 'longArray', value: new Array(37).fill([0, 0]) } } },
+        chunkData,
+        blockEntities: [],
+        skyLightMask: emptyMask,
+        blockLightMask: emptyMask,
+        emptySkyLightMask: emptyMask,
+        emptyBlockLightMask: emptyMask,
+        skyLight: [],
+        blockLight: [],
+        ...rest
+      })
+
+      it('the world height comes from the dimension codec of the login packet', async function () {
+        if (!hasChunkFormat) return this.skip()
+        server.on('playerJoin', (client) => client.write('login', bot.test.generateLoginPacket()))
+        await once(bot, 'login')
+        const types = registry.loginPacket.dimensionCodec?.['minecraft:dimension_type']?.entries
+        if (!types) return this.skip() // before 1.20.5 the codec is one NBT compound
+        const overworld = nbt.simplify(nbt.comp(Object.fromEntries(types.map(e => [e.key, e.value]))))['minecraft:overworld']
+        assert.strictEqual(bot.game.minY, overworld.min_y)
+        assert.strictEqual(bot.game.height, overworld.height)
+        assert.strictEqual(bot.game.height >> 4, sections)
+        // the chunk reader sizes its biome palette from the biome data: it has to match the registry the server sends
+        // (minecraft-data's 1.21.4 login packet is older than its biomes, so only the newest versions are compared)
+        if (registry.version['>=']('26.1')) assert.strictEqual(registry.loginPacket.dimensionCodec['minecraft:worldgen/biome'].entries.length, registry.biomesArray.length)
+      })
+
+      it('prismarine-chunk reads the hand-written sections and writes them back readable', function () {
+        if (!hasChunkFormat) return this.skip()
+        const first = bot.test.buildChunk()
+        first.load(Buffer.concat(world.map(section)))
+        const second = bot.test.buildChunk()
+        second.load(first.dump())
+        let differing = 0
+        world.forEach((states, s) => {
+          for (let i = 0; i < 4096; i++) {
+            const at = vec3(i & 15, minY + s * 16 + (i >> 8), (i >> 4) & 15)
+            if (first.getBlockStateId(at) !== states[i] || second.getBlockStateId(at) !== states[i]) differing++
+          }
+        })
+        assert.strictEqual(differing, 0)
+      })
+
+      it('reads chunk data into the right blocks: ids past the 26.1 count, palettes of 4 and 15/16 bits', async function () {
+        if (!hasChunkFormat) return this.skip()
+        await join(rawChunk(Buffer.concat(world.map(section))))
+        for (const [p, state] of spots) {
+          const at = p.offset(0, minY + 4 * 16, 0)
+          assert.strictEqual(bot.blockAt(at).stateId, state, `state at ${at}`)
+        }
+        assert.strictEqual(bot.blockAt(vec3(1, minY + 4 * 16 + 2, 3)).type, lastBlock.id)
+        // the whole section of 4096 different kinds, down to the highest state id
+        let checked = 0
+        for (let i = 0; i < 4096; i++) {
+          const block = bot.blockAt(vec3(i & 15, minY + 5 * 16 + (i >> 8), (i >> 4) & 15))
+          if (block.stateId !== mixed[i]) assert.fail(`state ${block.stateId} instead of ${mixed[i]} at index ${i}`)
+          checked++
+        }
+        assert.strictEqual(checked, 4096)
+        assert.strictEqual(bot.blockAt(vec3(100 & 15, minY + 5 * 16 + (100 >> 8), (100 >> 4) & 15)).type, topStateBlock.id)
+        assert.strictEqual(bot.blockAt(vec3(0, minY + 6 * 16 + 7, 0)).name, 'stone')
+        assert.strictEqual(bot.blockAt(vec3(0, minY + 9 * 16 + 7, 0)).name, 'air')
+        assert.strictEqual(bot.blockAt(vec3(0, minY, 0)).name, 'air')
+        if (registry.version['>=']('26.2')) assert.ok(lastBlock.id >= 1168 && maxState > 29872, 'the data has blocks the 26.1 registry does not')
+        if (registry.version['>=']('26.3')) assert.strictEqual(directBits, 16, '26.3 has more than 32768 block states')
+
+        // findBlocks over the decoded sections
+        const spot = vec3(1, minY + 4 * 16 + 2, 3)
+        const found = bot.findBlocks({ matching: lastBlock.id, maxDistance: 64, count: 4096 })
+        assert.ok(found.some(p => p.equals(spot)), 'findBlocks finds the last block of the registry')
+        assert.ok(found.every(p => bot.blockAt(p).type === lastBlock.id))
+        assert.ok(bot.findBlocks({ matching: topStateBlock.id, maxDistance: 64, count: 4096 }).some(p => p.equals(vec3(100 & 15, minY + 5 * 16 + (100 >> 8), (100 >> 4) & 15))))
+        assert.strictEqual(bot.findBlocks({ matching: registry.blocksByName.stone.id, maxDistance: 64, count: 5000 }).length >= 4096, true)
+        assert.strictEqual(bot.findBlock({ matching: lastBlock.id, maxDistance: 64 }).position.equals(spot), true)
+      })
+
+      it('reads the light of a chunk whose masks are long arrays, or a byte array on 26.3', async function () {
+        if (!hasChunkFormat) return this.skip()
+        const column = bot.test.buildChunk()
+        column.setBlockType(vec3(3, 70, 3), registry.blocksByName.stone.id)
+        column.setSkyLight(vec3(3, 71, 3), 12)
+        column.setBlockLight(vec3(3, 130, 3), 7)
+        await join({ ...generateChunkPacket(column), x: 0, z: 0 })
+        const loaded = bot.world.getColumn(0, 0)
+        assert.strictEqual(loaded.getSkyLight(vec3(3, 71, 3)), 12)
+        assert.strictEqual(loaded.getBlockLight(vec3(3, 130, 3)), 7)
+        assert.strictEqual(loaded.getSkyLight(vec3(3, 71, 4)), 0)
+        assert.strictEqual(bot.blockAt(vec3(3, 70, 3)).name, 'stone')
+      })
+    })
+
+    describe('containers', () => {
+      const Item = require('prismarine-item')(supportedVersion)
+      const Block = require('prismarine-block')(registry)
+      const pWindows = require('prismarine-windows')(supportedVersion)
+      const modern = registry.version['>=']('1.14') && !!registry.itemsByName.shulker_box // window types are numbers, shulker boxes exist
+      const components = registry.supportFeature('itemsWithComponents')
+      const templates = registry.version['>=']('26.1') // the container component lists optional ItemStackTemplates
+      const hasSequence = registry.version['>=']('1.19')
+      const item = (name, count = 1) => new Item(registry.itemsByName[name].id, count)
+
+      // The shulker box item of the tests: diamond x3 in slot 0 (with a data component), emerald x64 in slot 5, stone x1 in slot 26
+      const inside = [[0, 'diamond', 3], [5, 'emerald', 64], [26, 'stone', 1]]
+      function shulkerWith (contents, color = 'shulker_box') {
+        const shulker = item(color)
+        if (components) {
+          const list = Array.from({ length: Math.max(...contents.map(c => c[0])) + 1 }, () => (templates ? null : { itemCount: 0 }))
+          for (const [slot, name, count] of contents) {
+            list[slot] = {
+              itemId: registry.itemsByName[name].id,
+              itemCount: count,
+              addedComponentCount: slot === 0 ? 1 : 0,
+              removedComponentCount: 0,
+              components: slot === 0 ? [{ type: 'repair_cost', data: 7 }] : [],
+              removeComponents: []
+            }
+          }
+          shulker.components = [{ type: 'container', data: { contents: list } }]
+        } else {
+          shulker.nbt = nbt.comp({
+            BlockEntityTag: nbt.comp({
+              Items: nbt.list(nbt.comp(contents.map(([slot, name, count]) => ({
+                Slot: nbt.byte(slot),
+                id: nbt.string('minecraft:' + name),
+                Count: nbt.byte(count)
+              }))))
+            })
+          })
+        }
+        return shulker
+      }
+      const expected = inside.map(([slot, name, count]) => ({ slot, name, count }))
+      // the data component of slot 0 is only there on 1.20.5+
+      const withoutComponents = items => items.map(({ slot, name, count }) => ({ slot, name, count }))
+
+      it('reads the contents of a shulker box item sent over the wire: slots, counts, components', async function () {
+        if (!modern) return this.skip()
+        server.on('playerJoin', async (client) => {
+          await bot.test.pluginsLoaded
+          client.write('login', bot.test.generateLoginPacket())
+          client.write('set_slot', { windowId: 0, stateId: 1, slot: 36, item: Item.toNotch(shulkerWith(inside)) })
+        })
+        await bot.test.pluginsLoaded
+        await once(bot.inventory, 'updateSlot:36')
+        const held = bot.inventory.slots[36]
+        assert.strictEqual(held.name, 'shulker_box')
+        const found = bot.containerItems(held)
+        assert.deepStrictEqual(withoutComponents(found), expected)
+        assert.strictEqual(bot.vanilla.shulkerContents(held).length, 3)
+        if (components) assert.deepStrictEqual(found[0].components, [{ type: 'repair_cost', data: 7 }])
+        else assert.strictEqual(found[0].components, undefined)
+        assert.deepStrictEqual(bot.containerItems(item('shulker_box')), [])
+        assert.deepStrictEqual(bot.containerItems(null), [])
+      })
+
+      it('opens every window type: the menu names, with the container ones accepted as containers', async function () {
+        if (!modern) return this.skip()
+        const { matchWindowType } = require('../lib/container_blocks')
+        const types = Object.entries(pWindows.windows).filter(([name]) => name !== 'minecraft:inventory')
+        assert.ok(types.length >= 19, 'the menu list: generic 9x1-9x6, 3x3, anvil... stonecutter')
+        const containers = ['minecraft:generic_9x1', 'minecraft:generic_9x2', 'minecraft:generic_9x3', 'minecraft:generic_9x4', 'minecraft:generic_9x5', 'minecraft:generic_9x6',
+          'minecraft:generic_3x3', 'minecraft:hopper', 'minecraft:shulker_box']
+        if (registry.version['>=']('1.20.3')) containers.push('minecraft:crafter_3x3')
+        const opened = []
+        server.on('playerJoin', async (client) => {
+          client.write('login', bot.test.generateLoginPacket())
+          let windowId = 0
+          for (const [, data] of types) {
+            windowId++
+            client.write('open_window', { windowId, inventoryType: data.type, windowTitle: chatText(''), slotCount: data.slots - 36, entityId: 0 })
+            client.write('window_items', { windowId, stateId: 1, items: Array.from({ length: data.slots }, () => Item.toNotch(null)), carriedItem: Item.toNotch(null) })
+            await once(bot, 'windowOpen')
+          }
+        })
+        bot.on('windowOpen', (window) => opened.push(window))
+        await once(bot, 'login')
+        while (opened.length < types.length) await once(bot, 'windowOpen')
+        assert.deepStrictEqual(opened.map(w => w.type), types.map(([name]) => name))
+        for (const window of opened) {
+          assert.strictEqual(matchWindowType(window), containers.includes(window.type), `${window.type} as a container`)
+          assert.strictEqual(window.slots.length, pWindows.windows[window.type].slots)
+        }
+        assert.ok(containers.every(name => opened.some(w => w.type === name)), 'every container menu opened')
+      })
+
+      describe('scanContainers', () => {
+        // A row of containers at z = 2 (keys: x), the bot at (3.5, 65, 4.5): hopper, barrel, red shulker box, chest, a double chest,
+        // a dropper, and an ender chest too far to click (reach 4.5)
+        const row = 2
+        const layout = {
+          0: { block: 'hopper', window: 'minecraft:hopper' },
+          1: { block: 'barrel', window: 'minecraft:generic_9x3' },
+          2: { block: 'red_shulker_box', window: 'minecraft:shulker_box' },
+          3: { block: 'chest', window: 'minecraft:generic_9x3' },
+          4: { block: 'chest', window: 'minecraft:generic_9x6', props: { facing: 'south', type: 'left', waterlogged: false } },
+          5: { block: 'chest', window: 'minecraft:generic_9x6', props: { facing: 'south', type: 'right', waterlogged: false } },
+          6: { block: 'dropper', window: 'minecraft:generic_3x3', props: { facing: 'north', triggered: false } },
+          8: { block: 'ender_chest', window: 'minecraft:generic_9x3' }
+        }
+        const contentsOf = {
+          0: [[0, 'ender_pearl', 16]],
+          1: [[3, 'cobblestone', 64]],
+          2: [[4, 'stone', 64]],
+          3: [[0, 'diamond', 3], [13, 'blue_shulker_box', 1]],
+          4: [[40, 'gold_ingot', 9]],
+          6: [[8, 'arrow', 5]]
+        }
+
+        async function joinRow () {
+          const chunk = bot.test.buildChunk()
+          for (let x = 0; x < 16; x++) for (let z = 0; z < 16; z++) chunk.setBlockType(vec3(x, 64, z), registry.blocksByName.stone.id)
+          for (const [x, spec] of Object.entries(layout)) {
+            const info = registry.blocksByName[spec.block]
+            const state = spec.props ? Block.fromProperties(info.id, spec.props, 0).stateId : info.defaultState
+            chunk.setBlockStateId(vec3(Number(x), 65, row), state)
+          }
+          const received = []
+          let windowId = 0
+          await new Promise(resolve => {
+            server.on('playerJoin', async (client) => {
+              await bot.test.pluginsLoaded
+              client.write('login', bot.test.generateLoginPacket())
+              client.write('map_chunk', generateChunkPacket(chunk))
+              client.write('position', { x: 3.5, y: 65, z: 4.5, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: bot.registry.version['>=']('1.21.3') ? {} : 0, teleportId: 0 })
+              client.on('packet', (data, meta) => {
+                received.push({ name: meta.name, data })
+                if (meta.name !== 'block_place') return
+                const spec = layout[data.location.x]
+                if (!spec) return
+                const win = pWindows.windows[spec.window]
+                const items = Array.from({ length: win.slots }, () => Item.toNotch(null))
+                for (const [slot, name, count] of contentsOf[data.location.x] ?? []) items[slot] = Item.toNotch(name.endsWith('shulker_box') ? shulkerWith(inside, name) : item(name, count))
+                windowId++
+                client.write('open_window', { windowId, inventoryType: win.type, windowTitle: chatText(''), slotCount: win.slots - 36, entityId: 0 })
+                client.write('window_items', { windowId, stateId: 1, items, carriedItem: Item.toNotch(null) })
+              })
+              await once(bot, 'chunkColumnLoad')
+              await sleep(300) // lands on the floor
+              resolve()
+            })
+          })
+          return received
+        }
+
+        it('finds the containers around the bot, opens them one by one and indexes them, shulker contents included', async function () {
+          if (!modern || !hasSequence) return this.skip()
+          const received = await joinRow()
+          bot.vanilla.options.reach = 4.5
+          bot.vanilla.options.containerSpacingMs = 40
+          const visited = []
+          const index = await bot.vanilla.scanContainers(8, { settleMs: 20, onVisit: (entry) => visited.push(entry.blockName) })
+
+          // 8 blocks in the row, the double chest once
+          assert.strictEqual(index.length, 7)
+          assert.deepStrictEqual(visited, index.map(e => e.blockName))
+          assert.deepStrictEqual(index.map(e => e.blockName).sort(), ['barrel', 'chest', 'chest', 'dropper', 'ender_chest', 'hopper', 'red_shulker_box'])
+          const at = (name, x) => index.find(e => e.blockName === name && e.position.x === x)
+          assert.deepStrictEqual(at('hopper', 0).items, [{ slot: 0, name: 'ender_pearl', count: 16 }])
+          assert.deepStrictEqual(at('barrel', 1).items, [{ slot: 3, name: 'cobblestone', count: 64 }])
+          assert.deepStrictEqual(at('red_shulker_box', 2).items, [{ slot: 4, name: 'stone', count: 64 }])
+          assert.deepStrictEqual(at('dropper', 6).items, [{ slot: 8, name: 'arrow', count: 5 }])
+
+          // the single chest holds a blue shulker box with three items, which are listed with their slots
+          const chest = at('chest', 3)
+          assert.strictEqual(chest.items.length, 2)
+          assert.deepStrictEqual(chest.items[0], { slot: 0, name: 'diamond', count: 3 })
+          assert.strictEqual(chest.items[1].name, 'blue_shulker_box')
+          assert.strictEqual(chest.items[1].slot, 13)
+          assert.deepStrictEqual(withoutComponents(chest.items[1].shulkerItems), expected)
+          if (components) assert.strictEqual(chest.items[1].components, undefined, 'the container component is not repeated next to shulkerItems')
+
+          // the double chest: one entry, the half nearer to the bot is the one that is opened, the other half is named
+          const doubles = index.filter(e => e.blockName === 'chest' && e.double)
+          assert.strictEqual(doubles.length, 1)
+          assert.deepStrictEqual(doubles[0].items, [{ slot: 40, name: 'gold_ingot', count: 9 }])
+          assert.strictEqual(doubles[0].position.x, 4)
+          assert.strictEqual(doubles[0].double.x, 5)
+
+          // the ender chest is out of reach: reported, not opened
+          const ender = at('ender_chest', 8)
+          assert.strictEqual(ender.error, 'too-far')
+          assert.deepStrictEqual(ender.items, [])
+
+          // one window at a time: each is closed before the next click
+          const names = received.map(p => p.name).filter(n => ['block_place', 'close_window'].includes(n))
+          assert.strictEqual(names.filter(n => n === 'block_place').length, 6, 'the ender chest was never clicked')
+          for (let i = 1; i < names.length; i++) assert.ok(!(names[i] === 'block_place' && names[i - 1] === 'block_place'), 'a window stays open into the next click')
+          assert.strictEqual(bot.currentWindow, null)
+        })
+
+        it('leaves out what skip names, and a double chest with one half skipped', async function () {
+          if (!modern || !hasSequence) return this.skip()
+          await joinRow()
+          bot.vanilla.options.reach = 4.5
+          bot.vanilla.options.containerSpacingMs = 40
+          const index = await bot.vanilla.scanContainers(8, { settleMs: 20, center: vec3(3.5, 65.5, 2.5), skip: [vec3(2, 65, 2), vec3(5, 65, 2)] })
+          assert.deepStrictEqual(index.map(e => e.blockName).sort(), ['barrel', 'chest', 'dropper', 'ender_chest', 'hopper'])
+          assert.ok(!index.some(e => e.double))
+        })
+
+        it('reports a container that does not answer instead of throwing, and goes on with the next', async function () {
+          if (!modern || !hasSequence) return this.skip()
+          await joinRow()
+          bot.vanilla.options.reach = 4.5
+          bot.vanilla.options.openTimeoutMs = 200
+          bot.vanilla.options.containerSpacingMs = 40
+          const hopper = layout[0]
+          delete layout[0] // the server stays silent on the hopper
+          try {
+            const index = await bot.vanilla.scanContainers(1.5, { center: vec3(0.5, 65.5, 2.5), settleMs: 20 })
+            assert.deepStrictEqual(index.map(e => e.blockName).sort(), ['barrel', 'hopper'])
+            const failed = index.find(e => e.blockName === 'hopper')
+            assert.strictEqual(failed.error, 'timeout')
+            assert.deepStrictEqual(failed.items, [])
+            assert.strictEqual(index.find(e => e.blockName === 'barrel').items.length, 1)
+          } finally {
+            layout[0] = hopper
+          }
+        })
+      })
+    })
+
+    describe('wire changes of the newest versions', () => {
+      const playerAction = require('../lib/player_action')
+      const entityActionId = require('../lib/entity_action')
+      const isV263 = registry.version['>=']('26.3')
+
+      async function loggedIn () {
+        let client
+        server.on('playerJoin', (c) => {
+          client = c
+          c.write('login', bot.test.generateLoginPacket())
+        })
+        await once(bot, 'login')
+        await bot.test.pluginsLoaded
+        return client
+      }
+      const moved = (client, name, params) => {
+        const done = once(bot, 'entityMoved')
+        client.write(name, params)
+        return done.then(([entity]) => entity)
+      }
+
+      it('player actions: 26.3 inserted CHANGE_DESTROY_DIRECTION at 1, which moves every status after START', () => {
+        const shift = isV263 ? 1 : 0
+        assert.deepStrictEqual(
+          ['start_digging', 'abort_digging', 'finish_digging', 'drop_stack', 'drop_item', 'release_use_item', 'swap_hands'].map(a => playerAction(registry, a)),
+          [0, 1 + shift, 2 + shift, 3 + shift, 4 + shift, 5 + shift, 6 + shift])
+        assert.throws(() => playerAction(registry, 'jump'))
+      })
+
+      it('entity_action ids are looked up by meaning and round-trip, whatever the version calls them', function () {
+        if (!registry.version['>=']('1.21.6')) return this.skip() // before that the packet has a plain varint, see lib/entity_action.js
+        const serializer = mc.createSerializer({ state: 'play', isServer: false, version: supportedVersion })
+        const parser = mc.createDeserializer({ state: 'play', isServer: true, version: supportedVersion })
+        for (const action of ['leave_bed', 'start_sprinting', 'stop_sprinting', 'start_riding_jump', 'stop_riding_jump', 'open_inventory', 'start_elytra_flying']) {
+          const actionId = entityActionId(registry, action)
+          const back = parser.parsePacketBuffer(serializer.createPacketBuffer({ name: 'entity_action', params: { entityId: 1, actionId, jumpBoost: 0 } })).data.params
+          assert.strictEqual(back.actionId, actionId, action)
+        }
+        // the 26.2 data calls the first one leave_bed, the 26.3 data stop_sleeping
+        assert.strictEqual(entityActionId(registry, 'leave_bed'), registry.version['>=']('26.3') ? 'stop_sleeping' : registry.version['>=']('26.2') ? 'leave_bed' : 'stop_sleeping')
+      })
+
+      it('moves an entity by rel_entity_move, entity_move_look and sync_entity_position (26.3: move: { onGround, steps })', async function () {
+        if (!isV263) return this.skip()
+        const client = await loggedIn()
+        let entity = await moved(client, 'rel_entity_move', { entityId: 77, move: { onGround: true, steps: [{ dX: 4096, dY: -2048, dZ: 0, ticks: 0 }] } })
+        assert.deepStrictEqual(entity.position.toArray(), [1, -0.5, 0])
+        // stepped: the deltas are chained, the entity ends where their sum leads
+        entity = await moved(client, 'entity_move_look', { entityId: 77, move: { onGround: false, steps: [{ dX: 4096, dY: 0, dZ: 0, ticks: 1 }, { dX: 4096, dY: 0, dZ: 4096, ticks: 1 }] }, yaw: 64, pitch: 0 })
+        assert.deepStrictEqual(entity.position.toArray(), [3, -0.5, 1])
+        assert.ok(Math.abs(entity.yaw - require('../lib/conversions').fromNotchianYawByte(64)) < 1e-9)
+        entity = await moved(client, 'sync_entity_position', { entityId: 77, positionType: 'linear', x: 5, y: 6, z: 7, yaw: 90, pitch: 10, onGround: true })
+        assert.deepStrictEqual(entity.position.toArray(), [5, 6, 7])
+        entity = await moved(client, 'sync_entity_position', { entityId: 77, positionType: 'stepped', steps: [{ x: 1, y: 2, z: 3, tickOffset: 0 }, { x: 8, y: 9, z: 10, tickOffset: 1 }], yaw: 90, pitch: 10, onGround: false })
+        assert.deepStrictEqual(entity.position.toArray(), [8, 9, 10])
+      })
+
+      it('update_attributes: the movement speed sent by its wire id lands under minecraft:movement_speed', async function () {
+        if (!registry.version['>=']('1.20.5')) return this.skip()
+        const client = await loggedIn()
+        const wireId = registry.attributesArray.findIndex(a => a.resource === 'minecraft:movement_speed')
+        const packet = registry.protocol.play.toClient.types.packet_entity_update_attributes ? 'entity_update_attributes' : 'update_attributes'
+        const mapper = registry.protocol.play.toClient.types['packet_' + packet][1][1].type[1].type[1][0].type[1].mappings
+        assert.ok(wireId >= 0)
+        // the protocol data's key table is stale (31 names), so the wire id is written through the name it has for that id
+        assert.ok(mapper[wireId], `the protocol data names attribute ${wireId}`)
+        const updated = once(bot, 'entityAttributes')
+        client.write(packet, { entityId: bot.entity.id, properties: [{ key: mapper[wireId], value: 0.2, modifiers: [] }] })
+        await updated
+        assert.strictEqual(bot.entity.attributes['minecraft:movement_speed'].value, 0.2)
+        assert.strictEqual(Object.keys(bot.entity.attributes).filter(k => !k.startsWith('minecraft:')).length, 0, 'only resource names are left: ' + Object.keys(bot.entity.attributes))
+        assert.strictEqual(bot.entity.attributes[`minecraft:${mapper[wireId].replace(/^\w+\./, '')}`], undefined, 'the stale name of that id is not a key')
+      })
+    })
+
+    describe('totem of undying', () => {
+      const Item = require('prismarine-item')(supportedVersion)
+      const hasTotem = !registry.supportFeature('doesntHaveOffHandSlot') && !!registry.itemsByName.totem_of_undying
+      const totem = () => new Item(registry.itemsByName.totem_of_undying.id, 1)
+      const swapStatus = version['>=']('26.3') ? 7 : 6
+
+      async function ready () {
+        const chunk = bot.test.buildChunk()
+        for (let x = 0; x < 16; x++) for (let z = 0; z < 16; z++) chunk.setBlockType(vec3(x, 64, z), registry.blocksByName.stone.id)
+        await new Promise(resolve => {
+          server.on('playerJoin', async (client) => {
+            await bot.test.pluginsLoaded
+            client.write('login', bot.test.generateLoginPacket())
+            client.write('map_chunk', generateChunkPacket(chunk))
+            client.write('position', { x: 1.5, y: 65, z: 4.5, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: bot.registry.version['>=']('1.21.3') ? {} : 0, teleportId: 0 })
+            await once(bot, 'chunkColumnLoad')
+            await sleep(300) // lands on the floor
+            resolve()
+          })
+        })
+        bot.quickBarSlot = 0 // the server selects a slot on join
+        const writes = []
+        const write = bot._client.write
+        // the packets are recorded and not sent; a swap-hands is answered like the server would, after three ticks
+        bot._client.write = (name, params) => {
+          writes.push({ name, params })
+          if (name === 'block_dig' && params.status === swapStatus) {
+            const held = bot.inventory.slots[bot.QUICK_BAR_START + bot.quickBarSlot]
+            setTimeout(() => bot.inventory.updateSlot(45, held), 150)
+          }
+        }
+        return { writes, restore: () => { bot._client.write = write } }
+      }
+      const summary = writes => writes.filter(w => ['held_item_slot', 'block_dig', 'window_click'].includes(w.name))
+        .map(w => w.name === 'window_click' ? ['window_click', w.params.mode, w.params.mouseButton, w.params.slot] : [w.name, w.params.slotId ?? w.params.status])
+
+      it('emits totemUsed for entity_status 35 of the bot, not of another entity', async function () {
+        if (!hasTotem) return this.skip()
+        let client
+        server.on('playerJoin', (c) => {
+          client = c
+          c.write('login', bot.test.generateLoginPacket())
+        })
+        await once(bot, 'login')
+        await bot.test.pluginsLoaded
+        let pops = 0
+        bot.on('totemUsed', () => pops++)
+        client.write('entity_status', { entityId: 5, entityStatus: 35 })
+        client.write('entity_status', { entityId: bot.entity.id, entityStatus: 2 })
+        client.write('entity_status', { entityId: bot.entity.id, entityStatus: 35 })
+        await once(bot, 'totemUsed')
+        assert.strictEqual(pops, 1)
+        client.write('entity_status', { entityId: bot.entity.id, entityStatus: 35 })
+        await sleep(100)
+        assert.strictEqual(pops, 2)
+      })
+
+      it('ensureOffhandTotem swaps one in from the hotbar and returns once the server confirmed the offhand', async function () {
+        if (!hasTotem) return this.skip()
+        const { writes } = await ready()
+        bot.inventory.updateSlot(bot.QUICK_BAR_START + 3, totem())
+        assert.strictEqual(await bot.vanilla.ensureOffhandTotem(), true)
+        assert.deepStrictEqual(summary(writes), [['held_item_slot', 3], ['block_dig', swapStatus], ['held_item_slot', 0]])
+        // it holds one now: nothing more is written
+        writes.length = 0
+        assert.strictEqual(await bot.vanilla.ensureOffhandTotem(), true)
+        assert.deepStrictEqual(writes, [])
+      })
+
+      it('ensureOffhandTotem brings one from the main inventory to the hotbar first, with a number-key click', async function () {
+        // before 1.17 a click waits for the server's transaction, which this test does not send
+        if (!hasTotem || registry.supportFeature('transactionPacketExists')) return this.skip()
+        const { writes } = await ready()
+        bot.inventory.updateSlot(bot.QUICK_BAR_START, new Item(registry.itemsByName.stone.id, 1)) // slot 0 is taken: the totem goes to 1
+        bot.inventory.updateSlot(12, totem())
+        assert.strictEqual(await bot.vanilla.ensureOffhandTotem(), true)
+        assert.deepStrictEqual(summary(writes), [['window_click', 2, 1, 12], ['held_item_slot', 1], ['block_dig', swapStatus], ['held_item_slot', 0]])
+
+        writes.length = 0
+        bot.inventory.updateSlot(45, null)
+        bot.inventory.updateSlot(bot.QUICK_BAR_START + 1, null)
+        bot.inventory.updateSlot(20, totem())
+        assert.strictEqual(await bot.vanilla.ensureOffhandTotem({ fromInventory: false }), false)
+        assert.deepStrictEqual(writes, [], 'fromInventory: false leaves the inventory alone')
+      })
+
+      it('ensureOffhandTotem is false without a totem, or when the server does not show it', async function () {
+        if (!hasTotem) return this.skip()
+        const { writes, restore } = await ready()
+        assert.strictEqual(await bot.vanilla.ensureOffhandTotem(), false)
+        assert.deepStrictEqual(writes, [])
+        restore()
+        const sent = []
+        bot._client.write = (name, params) => sent.push(name)
+        bot.inventory.updateSlot(bot.QUICK_BAR_START + 1, totem())
+        assert.strictEqual(await bot.vanilla.ensureOffhandTotem(), false, 'the swap went out but the offhand did not change within 20 ticks')
+        assert.ok(sent.includes('block_dig'))
+      })
     })
 
     describe('activateItem', () => {
@@ -3146,7 +3737,9 @@ for (const supportedVersion of mineflayer.testedVersions) {
         if (entity.type === 'player') players.add(id)
         return entity
       }
-      const digs = () => timeline().filter(p => p.name === 'block_dig' && [0, 1, 2].includes(p.data.status))
+      // 26.3 inserted CHANGE_DESTROY_DIRECTION at status 1: every status after START is one higher. digs() reports the old numbers
+      const digs = () => timeline().filter(p => p.name === 'block_dig' && [0, 1 + statusShift, 2 + statusShift].includes(p.data.status))
+        .map(p => ({ ...p, data: { ...p.data, status: p.data.status && p.data.status - statusShift } }))
       const swingTicks = () => timeline().filter(p => p.name === 'arm_animation').map(p => p.tick)
       const A = vec3(1, 65, 3)
       const B = vec3(2, 65, 3)
@@ -3172,7 +3765,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
         const swings = swingTicks().filter(t => t >= dig[0].tick && t <= dig[1].tick)
         assert.deepStrictEqual(swings, Array.from({ length: ticks + 1 }, (_, i) => dig[0].tick + i), 'a swing in every tick of the dig')
         const t = timeline()
-        for (const [what, status] of [['START', 0], ['FINISH', 2]]) {
+        for (const [what, status] of [['START', 0], ['FINISH', 2 + statusShift]]) {
           const i = t.findIndex(p => p.name === 'block_dig' && p.data.status === status)
           assert.strictEqual(t[i + 1].name, 'arm_animation', `the swing follows ${what}`)
         }
@@ -3355,7 +3948,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
         assert.strictEqual(bot.usingHeldItem, false)
         await ticksOf(2)
         const t = timeline()
-        const release = t.find(p => p.name === 'block_dig' && p.data.status === 5)
+        const release = t.find(p => p.name === 'block_dig' && p.data.status === 5 + statusShift)
         const attackPacket = t.find(p => p.name === 'attack' || (p.name === 'use_entity' && p.data.mouse === 1))
         assert.ok(release && attackPacket && release.tick < attackPacket.tick, 'the release comes in an earlier tick')
 
@@ -3692,3 +4285,56 @@ for (const supportedVersion of mineflayer.testedVersions) {
     })
   })
 }
+
+describe('mcdata overlay (26.2, 26.3)', () => {
+  const overlay = require('../lib/mcdata/overlay')
+  const minecraftData = require('minecraft-data')
+
+  it('registers the data of each shipped version, and a second install changes nothing', () => {
+    assert.deepStrictEqual(overlay.VERSIONS, ['26.2', '26.3'])
+    const again = overlay.install()
+    assert.ok(again.length >= 1 && again.every(r => r.data['26.2'] === 'installed' && r.data['26.3'] === 'installed'), JSON.stringify(again))
+    for (const [version, protocol, blocks, items, entities] of [['26.2', 776, 1196, 1537, 158], ['26.3', 777, 1286, 1658, 161]]) {
+      const data = minecraftData(version)
+      assert.strictEqual(data.version.version, protocol)
+      assert.strictEqual(minecraftData(String(protocol)).version.minecraftVersion, version, 'found by protocol number too')
+      assert.deepStrictEqual([data.blocksArray.length, data.itemsArray.length, data.entitiesArray.length], [blocks, items, entities])
+      assert.ok(data.attributesArray.length >= 40 && data.biomesArray.length === 66 && data.windowsByName.Crafter, 'inherited files')
+      assert.ok(data.isNewerOrEqualTo('26.1') && data.supportFeature('newPlayerInputPacket'))
+    }
+    assert.ok(minecraftData('26.3').isNewerOrEqualTo('26.2') && minecraftData('26.2').isOlderThan('26.3'))
+    // the old module name keeps working
+    assert.strictEqual(require('../lib/mcdata/overlay26_2').install, overlay.install)
+  })
+
+  it('26.3 tool materials use the 26.3 item ids', () => {
+    const data = minecraftData('26.3')
+    const stone = data.blocksByName.stone
+    const speeds = data.materials[stone.material]
+    assert.strictEqual(speeds[data.itemsByName.diamond_pickaxe.id], 8)
+    assert.strictEqual(speeds[data.itemsByName.wooden_pickaxe.id], 2)
+    for (const block of data.blocksArray) {
+      for (const id of Object.keys(block.harvestTools ?? {})) assert.ok(data.items[id], `${block.name} names tool item ${id}`)
+    }
+  })
+
+  it('reads and writes the 26.3 entityDelta: flat and stepped, with the bytes of the wire format', () => {
+    const serializer = mc.createSerializer({ state: 'play', isServer: true, version: '26.3' })
+    const parser = mc.createDeserializer({ state: 'play', isServer: false, version: '26.3' })
+    const encode = (name, params) => serializer.createPacketBuffer({ name, params })
+    const flat = encode('rel_entity_move', { entityId: 5, move: { onGround: true, steps: [{ dX: 769, dY: -145, dZ: 0, ticks: 0 }] } })
+    assert.deepStrictEqual([...flat.subarray(1)], [5, 1, 0x03, 0x01, 0xff, 0x6f, 0, 0], 'entity id, properties (on ground, no steps), three i16')
+    const stepped = encode('entity_move_look', { entityId: 5, move: { onGround: false, steps: [{ dX: 1, dY: 2, dZ: 3, ticks: 2 }, { dX: 4, dY: 5, dZ: 6, ticks: 1 }] }, yaw: 1, pitch: 2 })
+    assert.deepStrictEqual([...stepped.subarray(1)], [5, 4, 2, 0, 1, 0, 2, 0, 3, 1, 0, 4, 0, 5, 0, 6, 1, 2], 'properties 2 steps << 1, each ticks + three i16, yaw, pitch')
+    for (const buffer of [flat, stepped]) {
+      const back = parser.parsePacketBuffer(buffer).data.params
+      assert.ok(back.move.steps.length >= 1)
+      assert.ok(encode(parser.parsePacketBuffer(buffer).data.name, back).equals(buffer))
+    }
+    // a cut-off delta is a partial read (the fork's protodef guard may turn the throw into a skipped packet), never a packet
+    const quiet = mc.createDeserializer({ state: 'play', isServer: false, version: '26.3', noErrorLogging: true })
+    let cut = null
+    try { cut = quiet.parsePacketBuffer(flat.subarray(0, flat.length - 2)) } catch (err) { assert.match(err.message, /entityDelta/) }
+    assert.ok(!cut?.data?.params?.move)
+  })
+})

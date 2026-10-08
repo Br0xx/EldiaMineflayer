@@ -31,6 +31,7 @@ module.exports = function grimLint (bot, opts = {}) {
   // PacketOrderH: clients >= 1.21.2 send sneak before sprint, clients < 1.21.2 sprint before sneak
   const sneakFirst = version['>='](hasTickEnd ? '1.21.2' : '99')
   const sneakByAction = version['<']('1.21.6')
+  const shiftedActions = version['>=']('26.3')
   const violations = []
   const report = opts.report ?? ((id, msg) => { throw new Error(`[grimLint ${id}] ${msg}`) })
 
@@ -192,7 +193,7 @@ module.exports = function grimLint (bot, opts = {}) {
     }
     if (moved) bad('PacketOrderO', `${name} between the movement packet and tick_end`)
     if (sentFlying && POST.has(name) && !(name === 'entity_action' && actionName(p.actionId) === 'leave_bed')) post.push(name)
-    w.names.push(name === 'entity_action' ? `${name}:${actionName(p.actionId)}` : name === 'block_dig' ? `${name}:${p.status}` : name)
+    w.names.push(name === 'entity_action' ? `${name}:${actionName(p.actionId)}` : name === 'block_dig' ? `${name}:${shiftedActions && p.status > 0 ? p.status - 1 : p.status}` : name)
     switch (name) {
       case 'held_item_slot':
         if (p.slotId === lastSlot) bad('BadPacketsA', `slot ${p.slotId} twice`)
@@ -222,35 +223,39 @@ module.exports = function grimLint (bot, opts = {}) {
         if (Math.abs(p.forward) > Math.fround(0.98) || Math.abs(p.sideways) > Math.fround(0.98)) bad('VehicleA', `impossible input ${p.forward} / ${p.sideways}`)
         if (bot.vehicle === null || bot.vehicle === undefined) bad('VehicleB', 'steer_vehicle while not riding')
         break
-      case 'block_dig':
-        if (p.status === 0 || p.status === 2) {
+      case 'block_dig': {
+        // 26.3 inserted CHANGE_DESTROY_DIRECTION at 1: the ids after START are one higher (lib/player_action.js)
+        const status = shiftedActions && p.status > 0 ? p.status - 1 : p.status
+        if (shiftedActions && p.status === 1) bad('BadPacketsL', 'CHANGE_DESTROY_DIRECTION is not something the bot sends')
+        if (status === 0 || status === 2) {
           primary('dig')
           w.digPkt = true
           sequenced('dig', p)
           clickGeometry('Break', p.location, p.face)
           // PositionBreakB: after an abort with a face other than DOWN the next break packet is a START with that face
-          if (abortFace !== null && (p.status !== 0 || p.face !== abortFace)) bad('PositionBreakB', `START/FINISH face ${p.face} after an abort with face ${abortFace}`)
+          if (abortFace !== null && (status !== 0 || p.face !== abortFace)) bad('PositionBreakB', `START/FINISH face ${p.face} after an abort with face ${abortFace}`)
           abortFace = null
-          if (p.status === 0) {
+          if (status === 0) {
             if (windows - lastFinishWindow < 6) bad('FastBreak', `START ${windows - lastFinishWindow} ticks after the FINISH, vanilla waits 5 ticks of destroy delay`)
             lastStart = p.location
           } else {
             if (lastStart && (lastStart.x !== p.location.x || lastStart.y !== p.location.y || lastStart.z !== p.location.z)) bad('WrongBreak', 'FINISH of another block than the START')
             lastFinishWindow = windows
           }
-        } else if (p.status === 1) {
+        } else if (status === 1) {
           if (p.sequence !== undefined && p.sequence !== 0) bad('BadPacketsH', 'abort must carry sequence 0')
           if (p.face !== 0) abortFace = p.face
         } else {
           if ((p.sequence !== undefined && p.sequence !== 0) || p.face !== 0 || p.location.x || p.location.y || p.location.z) {
             bad('BadPacketsL', 'non-dig block_dig must be (0,0,0) face 0 seq 0')
           }
-          if (p.status === 5) primary('release')
-          if (w.primary.size && (p.status === 3 || p.status === 4 || p.status === 6)) bad('PacketOrderG', 'drop/swap after another action')
-          if (p.status === 3 || p.status === 4) w.dropSeen = true
-          if (p.status === 6 && w.dropSeen) bad('PacketOrderL', 'swap after drop')
+          if (status === 5) primary('release')
+          if (w.primary.size && (status === 3 || status === 4 || status === 6)) bad('PacketOrderG', 'drop/swap after another action')
+          if (status === 3 || status === 4) w.dropSeen = true
+          if (status === 6 && w.dropSeen) bad('PacketOrderL', 'swap after drop')
         }
         break
+      }
       case 'block_place': {
         primary('use')
         if (p.direction >= 0 && p.direction <= 5) clickGeometry('Place', p.location, p.direction)

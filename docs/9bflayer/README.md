@@ -15,6 +15,7 @@ against.
 - [physics-special.md](research/physics-special.md): item use, fluids, climbing, effects and attributes, knockback, and
   26.x movement.
 - [v26_2.md](research/v26_2.md): the 26.1 to 26.2 protocol diff and how `lib/mcdata/` adds 26.2.
+- [v26_3.md](research/v26_3.md): the same for 26.3 (protocol 777): where its data came from, what the wire changes touch.
 
 ## Verified live
 
@@ -42,3 +43,14 @@ Nothing of this fork itself has run against a live Grim yet.
 - Two aimed actions at different targets at the same time are refused (the second look wins), not raced.
 - The reach attribute keys on 1.20.5 to 1.21.1 are guessed (minecraft-data is stale there). The fallback is 4.5 for
   blocks and 3.0 for entities.
+- **26.3 has never met a real server.** The data is minecraft-data's unmerged PR #1301 (the `pc_26_3` branch is a copy of
+  26.1). Open: `teleport_confirm` must carry the position and rotation (physics.js still writes only the id), what the new
+  serverbound `punch` packet is for, and the inherited particle/sound/biome/attribute data
+  ([v26_3.md](research/v26_3.md)).
+- The window type ids are prismarine-windows' list (the 1.20.3 menu registry). The join packets carry no menu registry to
+  check it against, so a menu inserted into the registry after 1.21.4 would shift the names of the ones behind it. Nothing
+  in minecraft-data or the 26.2/26.3 data says one was. `openContainer` only accepts windows named like a container.
+- `bot.vanilla.scanContainers` does not walk: pass `approach` (the pathfinder) or it reports containers out of reach as
+  `too-far`. It reads a double chest from the half nearer to the bot; trapped, copper and waxed copper chests count as chests.
+- prismarine-chunk reads light nibbles as longs (upstream PR #340), so single light values can sit in the wrong place
+  within an 8-byte group.

@@ -51,6 +51,23 @@ export interface BotOptions extends ClientOptions {
    * @default 60000
    */
   checkTimeoutInterval?: number
+  /**
+   * Ends a connection that has gone silent without erroring (reason 'watchdog'); `false` turns it off.
+   * Starts at 'login'. Keep `silenceMs` above `checkTimeoutInterval`.
+   * @default { enabled: true, silenceMs: 90000 }
+   */
+  watchdog?: boolean | WatchdogOptions
+}
+
+export interface WatchdogOptions {
+  /** @default true */
+  enabled?: boolean
+  /** Milliseconds without any packet after which the connection is ended @default 90000 */
+  silenceMs?: number
+  /** The same while the client is in the configuration phase @default 2 * silenceMs */
+  configurationSilenceMs?: number
+  /** How often to check @default min(5000, silenceMs / 4) */
+  checkIntervalMs?: number
 }
 
 export interface VanillaOptions {
@@ -74,6 +91,45 @@ export interface VanillaInteractOptions {
 export type VanillaClickResult =
   | { ok: true, face: number, cursor: Vec3 }
   | { ok: false, reason: 'too-far' | 'no-sight' }
+
+/** One stack in a container: `slot` is the container slot (the position in a shulker's `container` component) */
+export interface ContainerItem {
+  slot: number
+  name: string
+  count: number
+  /** Data components the stack carries (1.20.5+), without the `container` one */
+  components?: Array<{ type: string, data?: any }>
+  /** Shulker boxes: what is inside */
+  shulkerItems?: ContainerItem[]
+}
+
+/** What `bot.vanilla.scanContainers` found at one container block */
+export interface ContainerIndexEntry {
+  /** The block that was opened (the nearer half of a double chest) */
+  position: Vec3
+  blockName: string
+  items: ContainerItem[]
+  /** Double chest: the position of the other half */
+  double?: Vec3
+  /** Set when the container could not be read: 'too-far' | 'no-sight' | 'timeout' or the error message */
+  error?: string
+  message?: string
+}
+
+export interface ScanContainersOptions {
+  /** Search around this point @default the bot's position */
+  center?: Vec3
+  /** Containers to leave alone: their positions, or a test */
+  skip?: Vec3[] | ((block: Block) => boolean)
+  /** Walk into reach of the block before it is opened; without it, containers out of reach are reported with an error */
+  approach?: (block: Block) => Promise<void> | void
+  /** Wait after the window opens before reading it @default 250 */
+  settleMs?: number
+  /** Options for `bot.vanilla.openContainer` */
+  open?: Partial<VanillaInteractOptions>
+  /** Called after each container, e.g. to save progress */
+  onVisit?: (entry: ContainerIndexEntry) => Promise<void> | void
+}
 
 /** Block and inventory interactions the way a vanilla client makes them (`bot.vanilla`) */
 export interface VanillaInteract {
@@ -105,12 +161,26 @@ export interface VanillaInteract {
   /** One inventory click followed by a `clickGapMs` pause */
   windowClick: (slot: number, mouseButton: number, mode: number, options?: Partial<VanillaInteractOptions>) => Promise<void>
   shiftClick: (slot: number, options?: Partial<VanillaInteractOptions>) => Promise<void>
-  /** The swap-hands key (block_dig status 6, sequence 0) */
+  /** The swap-hands key (block_dig SWAP_ITEM_WITH_OFFHAND: status 6, 7 on 26.3; sequence 0) */
   swapHands: () => Promise<void>
   /** Move a matching hotbar item to the offhand with swap-hands; false if none is in the hotbar */
   offhandFromHotbar: (match: (item: Item) => boolean) => Promise<boolean>
   /** Move a matching main-inventory item to the hotbar with a number-key click; resolves with the hotbar index or -1 */
   toHotbar: (match: (item: Item) => boolean, options?: Partial<VanillaInteractOptions>) => Promise<number>
+  /**
+   * Keep a totem of undying in the offhand: swap one in from the hotbar, else (`fromInventory`) bring one to the
+   * hotbar first (standing still unless health <= 10). Waits up to 20 ticks for the server's slot update and
+   * resolves whether the offhand holds a totem. Use it on the pop: `bot.on('totemUsed', () => bot.vanilla.ensureOffhandTotem())`
+   */
+  ensureOffhandTotem: (options?: { fromInventory?: boolean }) => Promise<boolean>
+  /** The items inside a shulker box item, with their slots (same as `bot.containerItems`) */
+  shulkerContents: (item: Item) => ContainerItem[]
+  /**
+   * Open every container within `radius` blocks (chests, trapped and copper chests, barrels, ender chests, shulker
+   * boxes, hoppers, dispensers, droppers, crafters; a double chest once), nearest first, one at a time through
+   * `openContainer`, and list what each holds, shulker contents included.
+   */
+  scanContainers: (radius?: number, options?: ScanContainersOptions) => Promise<ContainerIndexEntry[]>
 }
 
 export type ChatLevel = 'enabled' | 'commandsOnly' | 'disabled'
@@ -148,11 +218,15 @@ export interface BotEvents {
   /** When `respawn` option is disabled, you can call this method manually to respawn. */
   spawn: () => Promise<void> | void
   respawn: () => Promise<void> | void
+  /** A totem of undying popped (entity_status 35 for the bot) */
+  totemUsed: () => Promise<void> | void
   game: () => Promise<void> | void
   title: (text: string, type: "subtitle" | "title") => Promise<void> | void
   rain: () => Promise<void> | void
   time: () => Promise<void> | void
   kicked: (reason: string, loggedIn: boolean) => Promise<void> | void
+  /** The watchdog is ending the connection after `silentMs` without a packet; 'end' follows with reason 'watchdog' */
+  watchdog: (silentMs: number) => Promise<void> | void
   end: (reason: string) => Promise<void> | void
   spawnReset: () => Promise<void> | void
   death: () => Promise<void> | void
@@ -256,6 +330,8 @@ export interface CommandBlockOptions {
 
 export interface Bot extends TypedEmitter<BotEvents> {
   username: string
+  /** When the last bytes arrived from the server (`Date.now()`), null before the connection */
+  lastPacketAt: number | null
   protocolVersion: string
   majorVersion: string
   version: string
@@ -452,6 +528,8 @@ export interface Bot extends TypedEmitter<BotEvents> {
   ) => Promise<void>
 
   openContainer: (chest: Block | Entity, direction?: Vec3, cursorPos?: Vec3) => Promise<Chest | Dispenser>
+  /** The items inside a shulker box item: its `container` component (1.20.5+) or `BlockEntityTag.Items`; `slot` is the slot in the box */
+  containerItems: (item: Item) => ContainerItem[]
 
   openChest: (chest: Block | Entity, direction?: number, cursorPos?: Vec3) => Promise<Chest>
 
@@ -1006,3 +1084,148 @@ export interface EntityActionOptions {
   /** interactions: the world point to aim at, clamped into the hitbox */
   point?: Vec3
 }
+
+// ── Keeping a bot connected (lib/connection.js) ─────────────────────────────
+
+export type PersistentBotState = 'connecting' | 'online' | 'waiting' | 'stopped'
+export type ReconnectVerdict = 'retry' | 'stop' | 'wait'
+
+export interface LoginBudget {
+  /** Logins (attempts that reached the socket) per `windowMs` for this bot; 0 = unlimited @default 6 */
+  perHour?: number
+  /**
+   * Logins per `windowMs` to one host:port from the whole process (every PersistentBot targeting it); 0 = unlimited.
+   * TCPShield counts per IP, not per account. @default 20
+   */
+  perHostPerHour?: number
+  /** Minimum time between two logins starting in this process, shared by every PersistentBot. @default 15000 for auth 'microsoft', else 0 */
+  minSpacingMs?: number
+  /** @default 3600000 */
+  windowMs?: number
+}
+
+/** Remembers the login timestamps across process restarts. Synchronous; failures are ignored. */
+export interface LoginStore {
+  load: () => LoginState | null | undefined
+  save: (state: LoginState) => void
+}
+
+/** `hosts` holds the history of the host budget, keyed by 'host:port' */
+export interface LoginState {
+  logins: number[]
+  hosts?: Record<string, number[]>
+}
+
+export interface ReconnectOptions {
+  /** @default true */
+  enabled?: boolean
+  /** Delay after the first failure, doubling after each one @default 10000 */
+  baseDelayMs?: number
+  /** @default 300000 */
+  maxDelayMs?: number
+  /** Fraction of random spread on every delay (0 to 1) @default 0.2 */
+  jitter?: number
+  /** Consecutive failed attempts before giving up; 0 = never @default 0 */
+  maxAttempts?: number
+  loginBudget?: LoginBudget
+  store?: LoginStore
+  /** Milliseconds from the attempt to the first spawn before the connection is dropped and counted as hung @default 180000 */
+  loginTimeoutMs?: number
+  /** Hung logins in a row after which the keeper stops (the IP is probably throttled); 0 = never @default 3 */
+  hungLoginLimit?: number
+  /**
+   * After that stop, one new try this long later (and again each time it hangs) instead of stopping for good;
+   * 'waiting' (reason 'throttled') says when. 0 = stop for good with cause 'throttled'. @default 3600000
+   */
+  hungLoginResumeMs?: number
+  /** Time online after which the backoff starts over @default 60000 */
+  stableMs?: number
+  /** How long 'wait' verdicts (already connected, server restart, 429) hold off @default 300000 */
+  longWaitMs?: number
+  /** 'already connected' kicks in a row before assuming another session owns the account @default 3 */
+  conflictLimit?: number
+  /** Pause before following a transfer packet @default 500 */
+  transferDelayMs?: number
+  /** Added to the built-in list (bans, whitelist, invalid session, outdated client…): kick texts that mean stop */
+  giveUpOn?: Array<string | RegExp>
+  /** Decide for a disconnect text; return nothing to use the built-in rules */
+  classify?: (reason: string, info: { kicked: boolean, error: Error | null, wasOnline: boolean, onlineMs: number, hung: boolean }) => ReconnectVerdict | void | undefined
+}
+
+export interface PersistentBotOptions extends Omit<BotOptions, 'client'> {
+  reconnect?: ReconnectOptions | false
+  /** Called with every new bot before it connects (load plugins here) */
+  onBot?: (bot: Bot) => void
+}
+
+export interface ReconnectDecision {
+  action: ReconnectVerdict
+  /** Why: 'user', 'stopped', 'give-up', 'classify', 'throttled', 'conflict', 'max-attempts', 'transfer', 'rate-limit', 'server-restart', 'hung-login', 'watchdog', 'kicked', 'network'… */
+  cause: string
+  delayMs: number
+  /** When the next login starts (`Date.now()` scale); null when stopped */
+  at: number | null
+  /** 'budget' or 'hostBudget' if a login budget, not the backoff, sets the time */
+  blockedBy?: 'budget' | 'hostBudget' | null
+  /** What the client reported ('socketClosed', 'watchdog', 'loginTimeout'…) */
+  endReason?: string
+  message?: string
+}
+
+export interface PersistentBotStats {
+  /** Logins that reached 'login' */
+  logins: number
+  /** Connections started, not counting transfers */
+  attempts: number
+  kicks: number
+  hungLogins: number
+  hungLoginsInARow: number
+  transfers: number
+  loginsLastHour: number
+  lastError: { message: string, code?: string, at: number } | null
+  lastKick: { reason: string, at: number } | null
+  lastEnd: { reason: string, at: number } | null
+  nextAttemptAt: number | null
+  onlineSince: number | null
+}
+
+export interface PersistentBotEvents {
+  /** A new bot, before it connects: attach listeners and load plugins */
+  bot: (bot: Bot) => void
+  login: (bot: Bot) => void
+  spawn: (bot: Bot) => void
+  /** A connection ended; `decision` says whether and when the next one starts */
+  end: (reason: string, decision: ReconnectDecision) => void
+  /** A retry is scheduled */
+  reconnecting: (info: { attempt: number, delayMs: number, at: number, reason: string }) => void
+  /** The login budget holds the next login back until `until` */
+  waiting: (info: { until: number, delayMs: number, reason: 'budget' | 'hostBudget' | 'throttled', loginsLastHour: number, perHour: number }) => void
+  /** The server moved the player to `host:port`; the keeper follows */
+  transfer: (target: { host: string, port: number }) => void
+  /** Microsoft device-code sign-in needed */
+  msaCode: (data: any) => void
+  state: (state: PersistentBotState, previous: PersistentBotState) => void
+  stopped: (reason: string, cause: string) => void
+  error: (err: Error) => void
+}
+
+/** Keeps a bot connected, reconnecting within a login budget (see docs/api.md) */
+export class PersistentBot extends (EventEmitter as new () => TypedEmitter<PersistentBotEvents>) {
+  constructor (options: PersistentBotOptions)
+  /** The current bot, replaced on every reconnect; null before the first login */
+  bot: Bot | null
+  readonly state: PersistentBotState
+  readonly stats: PersistentBotStats
+  /** Resolves with the bot once it has spawned. Rejects with code 'stopped' or 'timeout'. */
+  whenOnline (options?: { timeoutMs?: number }): Promise<Bot>
+  /** Runs a task on the current bot; rejects with code 'disconnected' if the bot ends first (`signal` aborts then) */
+  run<T> (task: (bot: Bot, signal: AbortSignal) => Promise<T> | T, options?: { wait?: boolean }): Promise<T>
+  /** Stops for good: cancels a pending retry or sign-in and ends the bot */
+  stop (reason?: string): void
+  /** Skips the wait and logs in now (the budget still applies unless `ignoreBudget`); restarts a stopped bot */
+  reconnectNow (options?: { ignoreBudget?: boolean }): boolean
+}
+
+export function createPersistentBot (options: PersistentBotOptions): PersistentBot
+/** Login history in a JSON file; several bots can share it with different `key`s */
+export function fileStore (file: string, options?: { key?: string }): LoginStore
