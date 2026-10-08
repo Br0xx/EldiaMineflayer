@@ -786,6 +786,633 @@ describe('9bflayer physics', function () {
     })
   })
 
+  // ---- Swimming, poses, stuck multipliers, bubble columns, elytra, flight (engine level) -------------------------------
+  describe('1.21.4 swimming and poses', () => {
+    const DEEP = w => w.fill(-30, FLOOR_Y, -30, 60, FLOOR_Y + 60, 30, 'water', [])
+    // a body in deep water that was sprinting last tick with its eyes under water, as one that has just started to swim
+    function swimmer (physics) {
+      const e = makeEntity(0.5, FLOOR_Y + 20)
+      e.onGround = false
+      e.vel.set(0, 0, 0)
+      e.pose = 'standing'
+      e.lastSprinting = true
+      e.eyeInWater = true
+      e.control.sprint = true
+      return e
+    }
+
+    it('sprint + eyes under water + in water: swimming, the pose is the 0.6 box with eyes at 0.4, from the next tick', () => {
+      const { physics, world } = setup('1.21.4', DEEP)
+      const e = swimmer()
+      e.control.forward = true
+      physics.simulatePlayer(e, world)
+      assert.strictEqual(e.isSwimming, true)
+      assert.strictEqual(e.pose, 'swimming') // decided at the end of the tick...
+      assert.strictEqual(physics.playerHeight, F(1.8)) // ...this tick still had the standing box
+      physics.simulatePlayer(e, world)
+      assert.strictEqual(physics.playerHeight, F(0.6))
+      assert.strictEqual(physics.poses.swimming.eye, F(0.4))
+    })
+
+    it('swims forward at 0.98 * 0.02 a tick with friction 0.9, and its vertical speed follows the look (0.06, 0.085 steeply down)', () => {
+      for (const pitch of [0.5, -0.7, 0]) {
+        const { physics, world } = setup('1.21.4', DEEP)
+        const e = swimmer()
+        e.control.forward = true
+        e.pitch = pitch
+        let vx = 0
+        let vy = 0
+        const lookY = Math.sin(pitch)
+        const scale = lookY < -0.2 ? 0.085 : 0.06
+        for (let i = 0; i < 25; i++) {
+          physics.simulatePlayer(e, world)
+          // vanilla by hand: the look steers vy, then moveRelative adds 0.02 * 0.98 along x, then 0.9 / 0.8 friction;
+          // a sprint-swimmer has no gravity
+          vy += (lookY - vy) * scale
+          vy *= 0.8
+          vx = (vx + 0.02 * 0.98) * 0.9
+          roughly(e.vel.x, vx, 1e-6, `vx ${i}`)
+          roughly(e.vel.y, vy, 2e-4, `vy ${i} pitch ${pitch}`)
+        }
+      }
+    })
+
+    it('does not steer upwards near the surface unless it jumps (no water 0.9 above the feet)', () => {
+      const { physics, world } = setup('1.21.4', w => w.fill(-30, FLOOR_Y, -30, 60, FLOOR_Y, 30, 'water', []))
+      const mk = jump => {
+        const e = makeEntity(0.5, FLOOR_Y + 0.15)
+        e.onGround = false
+        e.isSwimming = true
+        e.lastSprinting = true
+        e.eyeInWater = true
+        e.pose = 'swimming'
+        e.pitch = 0.5
+        e.vel.set(0, 0.1, 0)
+        e.control.sprint = true
+        e.control.jump = jump
+        physics.simulatePlayer(e, world)
+        return e
+      }
+      roughly(mk(false).vel.y, 0.1 * 0.8, 1e-8, 'no steering')
+      roughly(mk(true).vel.y, (0.14 + (Math.sin(0.5) - 0.14) * 0.06) * 0.8, 3e-4, 'steering while jumping (the jump first)')
+    })
+
+    it('swimming ends a tick after the sprint, standing follows at the end of that tick; out of the water at once', () => {
+      const { physics, world } = setup('1.21.4', DEEP)
+      const e = swimmer()
+      physics.simulatePlayer(e, world)
+      assert.strictEqual(e.pose, 'swimming')
+      e.control.sprint = false
+      physics.simulatePlayer(e, world) // the last tick still counted as sprinting
+      assert.strictEqual(e.isSwimming, true)
+      physics.simulatePlayer(e, world)
+      assert.strictEqual(e.isSwimming, false)
+      assert.strictEqual(e.pose, 'standing')
+      // out of the water: not swimming at once
+      const dry = setup('1.21.4')
+      const d = makeEntity()
+      d.pose = 'swimming'
+      d.isSwimming = true
+      d.lastSprinting = true
+      dry.physics.simulatePlayer(d, dry.world)
+      assert.strictEqual(d.isSwimming, false)
+      assert.strictEqual(d.pose, 'standing')
+    })
+
+    it('a ceiling keeps the pose small: 1.5 clearance crouches, 1.0 crawls (swimming pose out of the water)', () => {
+      const out = (clearance, shapes) => {
+        const { physics, world } = setup('1.21.4', w => w.fill(-30, FLOOR_Y + 1, -30, 60, FLOOR_Y + 1, 30, 'stone', shapes))
+        const e = makeEntity()
+        e.pose = 'swimming'
+        e.isSwimming = true
+        e.lastSprinting = true
+        physics.simulatePlayer(e, world)
+        return { e, physics, world, clearance }
+      }
+      assert.strictEqual(out(1.5, [[0, 0.5, 0, 1, 1, 1]]).e.pose, 'crouching') // the ceiling is at 1.5 above the floor
+      const crawl = out(1.0, FULL)
+      assert.strictEqual(crawl.e.pose, 'swimming')
+      assert.strictEqual(crawl.e.isInWater, false) // so it is crawling
+    })
+
+    it('crawls and crouches at the sneaking speed (0.3), the crouch also while the key is already up', () => {
+      const speed = (pose, build, sneakKey) => {
+        const { physics, world } = setup('1.21.4', build)
+        const e = makeEntity()
+        e.pose = pose
+        e.wasSneaking = pose === 'crouching'
+        e.control.forward = true
+        e.control.sneak = !!sneakKey
+        return run(physics, world, e, 120, en => en.pos.x).slice(-2).reduce((a, b) => b - a)
+      }
+      const standing = speed('standing')
+      const crouch = speed('crouching', undefined, true)
+      const crawl = speed('swimming', w => w.fill(-30, FLOOR_Y + 1, -30, 60, FLOOR_Y + 1, 30, 'stone', FULL))
+      roughly(crouch, standing * 0.3, 2e-4, 'crouch')
+      roughly(crawl, standing * 0.3, 2e-4, 'crawl')
+      // standing up needs room: the pose of the last tick being crouching with a ceiling above keeps the slowdown without the key
+      const { physics, world } = setup('1.21.4', w => w.fill(-30, FLOOR_Y + 1, -30, 60, FLOOR_Y + 1, 30, 'stone', [[0, 0.5, 0, 1, 1, 1]]))
+      const low = makeEntity()
+      low.pose = 'crouching'
+      low.control.forward = true
+      physics.simulatePlayer(low, world)
+      roughly(low.pos.x - 0.5, 0.1 * F(F(0.3) * F(0.98)), 1e-6, 'no room to stand: slow without a key')
+    })
+
+    it('sneaking in water sinks by 0.04 a tick before the move', () => {
+      const { physics, world } = setup('1.21.4', DEEP)
+      const e = makeEntity(0.5, FLOOR_Y + 20)
+      e.onGround = false
+      e.vel.set(0, 0, 0)
+      physics.simulatePlayer(e, world)
+      const still = e.vel.y
+      const s = makeEntity(0.5, FLOOR_Y + 20)
+      s.onGround = false
+      s.vel.set(0, 0, 0)
+      s.control.sneak = true
+      physics.simulatePlayer(s, world)
+      roughly(s.vel.y - still, -0.04 * 0.8, 1e-9)
+    })
+
+    it('a gliding body is the 0.6 box and flies through a gap a block high', () => {
+      const { physics, world } = setup('1.21.4', w => {
+        w.fill(1, FLOOR_Y + 3, -2, 12, FLOOR_Y + 3, 2, 'stone', FULL) // floor of the gap (top at +4)
+        w.fill(1, FLOOR_Y + 5, -2, 12, FLOOR_Y + 5, 2, 'stone', FULL) // ceiling of the gap (bottom at +5)
+      })
+      const e = makeEntity(0.5, FLOOR_Y + 4.2)
+      e.onGround = false
+      e.elytraFlying = true
+      e.elytraEquipped = true
+      e.pose = 'gliding'
+      e.vel.set(0.5, 0.05, 0)
+      e.pitch = 0.05
+      run(physics, world, e, 8, en => en.pos.x)
+      assert.ok(e.pos.x > 3.5, `flew into the gap: x ${e.pos.x}`)
+      assert.strictEqual(e.pose, 'gliding')
+      // and with the standing box (no pose) the same gap is a wall
+      const { physics: p2, world: w2 } = setup('1.21.4', w => {
+        w.fill(1, FLOOR_Y + 3, -2, 12, FLOOR_Y + 3, 2, 'stone', FULL)
+        w.fill(1, FLOOR_Y + 5, -2, 12, FLOOR_Y + 5, 2, 'stone', FULL)
+      })
+      const t = makeEntity(0.5, FLOOR_Y + 4.2)
+      t.onGround = false
+      t.elytraFlying = true
+      t.elytraEquipped = true
+      t.vel.set(0.5, 0.05, 0)
+      t.pitch = 0.05
+      run(p2, w2, t, 8, en => en.pos.x)
+      assert.ok(t.pos.x < 1, `stopped at the gap: x ${t.pos.x}`)
+    })
+  })
+
+  describe('1.21+ block effects', () => {
+    const column = (up) => w => {
+      w.fill(-30, FLOOR_Y, -30, 60, FLOOR_Y + 20, 30, 'water', [])
+      for (let y = FLOOR_Y; y <= FLOOR_Y + 20; y++) w.set(0, y, 0, 'bubble_column', [], up ? 1 : 0)
+    }
+    const afterOneTick = (version) => {
+      const { physics, world } = setup(version, column(true))
+      const e = makeEntity(0.5, FLOOR_Y + 10, 0.5)
+      e.onGround = false
+      e.vel.set(0, 0, 0)
+      physics.simulatePlayer(e, world)
+      return e.vel.y
+    }
+
+    it('a bubble column pushes before the water friction up to 1.21.1 and after it from 1.21.2', () => {
+      // the box is in two cells of the column (more column above each): +0.06 for each; the water friction is 0.8 and
+      // gravity / 16 (0.005) sinks
+      roughly(afterOneTick('1.21.1'), (0 + 0.12) * 0.8 - 0.005, 1e-8, '1.21.1')
+      roughly(afterOneTick('1.21.4'), (0 * 0.8 - 0.005) + 0.12, 1e-8, '1.21.4')
+      roughly(afterOneTick('1.21.2'), (0 * 0.8 - 0.005) + 0.12, 1e-8, '1.21.2')
+      roughly(afterOneTick('26.2'), (0 * 0.8 - 0.005) + 0.12, 1e-8, '26.2')
+    })
+
+    it('the top of a column (air above) pushes 0.1 up to 1.8, a down column pulls 0.03 down to -0.3 (-0.9 at the top)', () => {
+      const { physics, world } = setup('1.21.4', w => {
+        w.fill(-30, FLOOR_Y, -30, 60, FLOOR_Y + 3, 30, 'water', [])
+        for (let y = FLOOR_Y; y <= FLOOR_Y + 3; y++) w.set(0, y, 0, 'bubble_column', [], 1)
+      })
+      const e = makeEntity(0.5, FLOOR_Y + 3.2, 0.5) // in the top cell, with air above (the water is only 4 deep)
+      e.onGround = false
+      e.vel.set(0, 0, 0)
+      physics.simulatePlayer(e, world)
+      roughly(e.vel.y, (0 * 0.8 - 0.005) + 0.1, 1e-8)
+      const d = setup('1.21.4', column(false))
+      const f = makeEntity(0.5, FLOOR_Y + 10, 0.5)
+      f.onGround = false
+      f.vel.set(0, 0, 0)
+      f.fallDistance = 5
+      d.physics.simulatePlayer(f, d.world)
+      assert.strictEqual(f.fallDistance, 0)
+      roughly(f.vel.y, (0 * 0.8 - 0.005) - 0.03 * 2, 1e-8, 'each of the two cells takes 0.03 off')
+      f.vel.set(0, -0.29, 0)
+      d.physics.simulatePlayer(f, d.world)
+      assert.strictEqual(f.vel.y, -0.3, 'not below -0.3')
+    })
+
+    const webCell = (name, shapes = []) => w => w.set(0, FLOOR_Y, 0, name, shapes)
+    const stepInto = (version, name, tweak) => {
+      const { physics, world } = setup(version, webCell(name))
+      const e = makeEntity(0.5, FLOOR_Y, 0.5)
+      e.control.forward = true
+      if (tweak) tweak(e)
+      const xs = run(physics, world, e, 4, en => en.pos.x)
+      return { e, xs, step: xs.map((x, i) => x - (i ? xs[i - 1] : 0.5)) }
+    }
+
+    it('cobweb: the move is 0.25 / 0.05 / 0.25 of the speed and the speed is cleared, every tick it stays in it', () => {
+      for (const version of ['1.21.1', '1.21.4', '26.2']) {
+        const { step, e } = stepInto(version, 'cobweb')
+        // tick 1 walks free (the web is found at the end of the tick); tick 2 moves what is left of it plus the new input
+        // by a quarter, and clears the speed; from then on it is the input alone, 0.098 * 0.25
+        roughly(step[0], 0.098, 1e-6, `${version} free first tick`)
+        roughly(step[1], (0.098 * F(0.6) * F(0.91) + 0.098) * 0.25, 1e-6, `${version} second tick`)
+        for (let i = 2; i < 4; i++) roughly(step[i], 0.098 * 0.25, 1e-6, `${version} stuck tick ${i}`)
+        assert.strictEqual(e.fallDistance, 0)
+      }
+    })
+
+    it('cobweb with Weaving is 0.5; a sweet berry bush 0.8 / 0.75 / 0.8; powder snow 0.9 / 1.5 / 0.9 for the block the feet are in', () => {
+      const weaving = stepInto('1.21.4', 'cobweb', e => { e.weaving = 1 })
+      roughly(weaving.step[2], 0.098 * 0.5, 1e-6, 'weaving')
+      const berry = stepInto('1.21.4', 'sweet_berry_bush')
+      roughly(berry.step[2], 0.098 * F(0.8), 1e-6, 'berry')
+      const snow = stepInto('1.21.4', 'powder_snow')
+      roughly(snow.step[2], 0.098 * F(0.9), 1e-6, 'powder snow')
+      // powder snow only counts when the feet are in it: standing a block above, in the air over it, does nothing
+      const { physics, world } = setup('1.21.4', w => w.set(0, FLOOR_Y + 1, 0, 'powder_snow', []))
+      const high = makeEntity(0.5, FLOOR_Y + 0.5, 0.5) // the box reaches into the snow, the feet are in the air below it
+      high.onGround = false
+      high.vel.set(0, 0, 0)
+      physics.simulatePlayer(high, world)
+      assert.ok(!high.stuckSpeed, 'only the block the feet are in sticks')
+    })
+
+    it('a stuck body keeps no jump: the jump speed is cleared with the rest of the velocity', () => {
+      const { physics, world } = setup('1.21.4', webCell('cobweb'))
+      const e = makeEntity(0.5, FLOOR_Y, 0.5)
+      run(physics, world, e, 1, en => en.pos.y) // stuck now
+      e.control.jump = true
+      physics.simulatePlayer(e, world)
+      assert.ok(e.pos.y - FLOOR_Y < 0.05, `rose ${e.pos.y - FLOOR_Y}`)
+    })
+
+    it('powder snow: a player in leather boots stands on it, sneaking or without boots it sinks, and boots climb it like a ladder', () => {
+      const build = w => w.set(0, FLOOR_Y, 0, 'powder_snow', [])
+      const land = (tweak) => {
+        const { physics, world } = setup('1.21.4', build)
+        const e = makeEntity(0.5, FLOOR_Y + 1.4, 0.5)
+        e.onGround = false
+        e.vel.set(0, 0, 0)
+        tweak(e)
+        run(physics, world, e, 25, en => en.pos.y)
+        return e
+      }
+      const boots = land(e => { e.leatherBoots = true })
+      roughly(boots.pos.y, FLOOR_Y + 1, 1e-6, 'on top')
+      assert.strictEqual(boots.onGround, true)
+      assert.ok(land(e => { e.leatherBoots = false }).pos.y < FLOOR_Y + 0.5, 'no boots: through')
+      assert.ok(land(e => { e.leatherBoots = true; e.control.sneak = true }).pos.y < FLOOR_Y + 0.5, 'sneaking: through')
+      // after a fall of more than 2.5 blocks the block holds only its lower 0.9 (and then the body is in it, which
+      // resets the fall distance: it sinks on, as in vanilla)
+      {
+        const { physics, world } = setup('1.21.4', build)
+        const e = makeEntity(0.5, FLOOR_Y + 0.95, 0.5)
+        e.onGround = false
+        e.vel.set(0, -0.2, 0)
+        e.leatherBoots = true
+        e.fallDistance = 3
+        physics.simulatePlayer(e, world)
+        assert.strictEqual(e.onGround, true)
+        roughly(e.pos.y, FLOOR_Y + F(0.9), 1e-6, 'stopped by the lower 0.9')
+        assert.strictEqual(e.fallDistance, 0, 'and now the feet are in the snow')
+      }
+      // in the block: the jump key climbs at 0.2 (-0.08 gravity, 0.98 drag)
+      const { physics, world } = setup('1.21.4', build)
+      const c = makeEntity(0.5, FLOOR_Y, 0.5)
+      c.onGround = false
+      c.vel.set(0, 0, 0)
+      c.leatherBoots = true
+      c.control.jump = true
+      physics.simulatePlayer(c, world)
+      roughly(c.vel.y, (0.2 - 0.08) * 0.98, 1e-6)
+      c.leatherBoots = false
+      c.vel.set(0, 0, 0)
+      physics.simulatePlayer(c, world)
+      assert.ok(c.vel.y < 0.1)
+    })
+  })
+
+  describe('1.21+ elytra and flight', () => {
+    it('the elytra follows the float look vector: no lift at 0 pitch, the look-down term and the 0.99F, 0.98F, 0.99F drag', () => {
+      const { physics, world } = setup('1.21.4')
+      const e = makeEntity(0.5, FLOOR_Y + 30)
+      e.onGround = false
+      e.elytraFlying = true
+      e.elytraEquipped = true
+      e.vel.set(1, 0, 0)
+      e.pitch = 0
+      physics.simulatePlayer(e, world)
+      // yaw EAST: the look is +x; horizontal speed 1; gravity -0.08 * (-1 + 0.75) = -0.02 on vy... as vy < 0 it turns into speed
+      const vyBefore = -0.08 * (1 - 0.75)
+      const turn = vyBefore * -0.1
+      roughly(e.vel.y, (vyBefore + turn) * F(0.98), 1e-6, 'vy')
+      roughly(e.vel.x, (1 + turn) * F(0.99), 1e-3, 'vx')
+    })
+
+    it('the rocket boost comes after the move of the tick, on the look of that tick', () => {
+      const { physics, world } = setup('1.21.4')
+      const e = makeEntity(0.5, FLOOR_Y + 30)
+      e.onGround = false
+      e.elytraFlying = true
+      e.elytraEquipped = true
+      e.fireworkRocketDuration = 3
+      physics.simulatePlayer(e, world)
+      assert.ok(e.pos.x - 0.5 < 0.02, `the first move is not boosted: ${e.pos.x - 0.5}`) // (it turns a little of its fall into speed)
+      roughly(e.vel.x, 0.855, 1e-2, 'boosted at the end: 0.1 + (1.5 - vx) * 0.5 on top of vx')
+      assert.strictEqual(e.fireworkRocketDuration, 2)
+      const before = e.pos.x
+      physics.simulatePlayer(e, world)
+      assert.ok(e.pos.x - before > 0.5, 'then it moves')
+    })
+
+    it('creative flight: 0.05 a tick of acceleration (doubled sprinting), drag 0.91, climbs at flying speed * 3 with the vertical speed decaying by 0.6', () => {
+      const { physics, world } = setup('1.21.4')
+      const fly = (control) => {
+        const e = makeEntity(0.5, FLOOR_Y + 30)
+        e.onGround = false
+        e.flying = true
+        e.flyingSpeed = 0.05
+        e.vel.set(0, 0, 0)
+        Object.assign(e.control, control)
+        run(physics, world, e, 120, en => en.pos.x)
+        return e
+      }
+      let vx = 0
+      for (let i = 0; i < 120; i++) vx = (vx + 0.05 * 0.98) * 0.91
+      roughly(fly({ forward: true }).vel.x, vx, 1e-6, 'flying')
+      let vs = 0
+      for (let i = 0; i < 120; i++) vs = (vs + 0.1 * 0.98) * 0.91
+      roughly(fly({ forward: true, sprint: true }).vel.x, vs, 1e-6, 'sprint flying')
+      let vy = 0
+      for (let i = 0; i < 120; i++) vy = (vy + 0.15) * 0.6
+      roughly(fly({ jump: true }).vel.y, vy, 1e-6, 'up')
+      roughly(fly({ sneak: true }).vel.y, -vy, 1e-6, 'down')
+      const hover = fly({})
+      assert.strictEqual(hover.vel.y, 0, 'no gravity')
+      assert.strictEqual(hover.pose, undefined)
+    })
+
+    it('a flying player floats on water and does not swim', () => {
+      const { physics, world } = setup('1.21.4', w => w.fill(-30, FLOOR_Y, -30, 60, FLOOR_Y + 60, 30, 'water', []))
+      const e = makeEntity(0.5, FLOOR_Y + 20)
+      e.onGround = false
+      e.flying = true
+      e.vel.set(0, 0, 0)
+      e.control.forward = true
+      run(physics, world, e, 5, en => en.pos.x)
+      assert.strictEqual(e.vel.y, 0)
+      assert.ok(e.vel.x > 0.1, `air speed, not water speed: ${e.vel.x}`)
+    })
+
+    it('a spectator passes through walls', () => {
+      const { physics, world } = setup('1.21.4', w => w.fill(3, FLOOR_Y, -3, 4, FLOOR_Y + 3, 3, 'stone', FULL))
+      const e = makeEntity(0.5, FLOOR_Y + 1)
+      e.onGround = false
+      e.flying = true
+      e.spectator = true
+      e.control.forward = true
+      run(physics, world, e, 40, en => en.pos.x)
+      assert.ok(e.pos.x > 6, `through the wall: ${e.pos.x}`)
+    })
+
+    it('older versions keep their elytra and flight code (1.20.4 does not fly or glide with poses)', () => {
+      const { physics, world } = setup('1.20.4')
+      const e = makeEntity(0.5, FLOOR_Y + 30)
+      e.onGround = false
+      e.flying = true // the original has no flight
+      e.vel.set(0, 0, 0)
+      physics.simulatePlayer(e, world)
+      assert.ok(e.vel.y < 0, 'gravity applies')
+    })
+  })
+
+  // ---- The tick driver (lib/plugins/physics.js) against a mock server, with the packet-order validator of Grim ----------
+  describe('the driver around the engine (mock server)', function () {
+    this.timeout(30 * 1000)
+    const grimLint = require('./grimLint')
+    const nbt = require('prismarine-nbt')
+    for (const version of ['1.21.4', '26.2']) {
+      describe(version, () => {
+        const registry = require('prismarine-registry')(version)
+        const Chunk = require('prismarine-chunk')(version)
+        const Item = require('prismarine-item')(registry)
+        const entityActionId = require('../lib/entity_action')
+        const names = list => list.map(p => p.name)
+        const chatText = (text) => registry.supportFeature('chatPacketsUseNbtComponents') ? nbt.comp({ text: nbt.string(text) }) : JSON.stringify({ text })
+        let server, bot, client, lint, received
+
+        beforeEach(async () => {
+          const port = await getPort()
+          server = mc.createServer({ 'online-mode': false, version, port })
+          server.on('connection', c => {
+            const write = c.write
+            c.write = function (name, params) {
+              if (name === 'success' && params.sessionId === undefined) params = { ...params, sessionId: require('crypto').randomUUID() }
+              return write.call(this, name, params)
+            }
+          })
+          await once(server, 'listening')
+          bot = mineflayer.createBot({ username: 'player', version, port })
+          bot.test = { pluginsLoaded: new Promise(resolve => bot.once('inject_allowed', resolve)) }
+        })
+        afterEach((done) => {
+          if (bot._client.ended) done()
+          else bot.on('end', () => done())
+          server.close()
+        })
+
+        function chunkPacket (chunk) {
+          const lights = chunk.dumpLight()
+          return {
+            x: 0,
+            z: 0,
+            groundUp: true,
+            biomes: chunk.dumpBiomes !== undefined ? chunk.dumpBiomes() : undefined,
+            heightmaps: { type: 'compound', name: '', value: { MOTION_BLOCKING: { type: 'longArray', value: new Array(36).fill([0, 0]) } } },
+            bitMap: chunk.getMask(),
+            chunkData: chunk.dump(),
+            blockEntities: [],
+            trustEdges: false,
+            skyLightMask: lights && lights.skyLightMask,
+            blockLightMask: lights && lights.blockLightMask,
+            emptySkyLightMask: lights && lights.emptySkyLightMask,
+            emptyBlockLightMask: lights && lights.emptyBlockLightMask,
+            skyLight: lights?.skyLight,
+            blockLight: lights?.blockLight
+          }
+        }
+
+        // A stone floor at y = 64 (the bot stands at (1.5, 65, 4.5)); `build(chunk)` adds the rest
+        async function join (build) {
+          const chunk = bot.supportFeature('tallWorld') ? new Chunk({ minY: -64, worldHeight: 384 }) : new Chunk()
+          for (let x = 0; x < 16; x++) for (let z = 0; z < 16; z++) chunk.setBlockType(new Vec3(x, 64, z), registry.blocksByName.stone.id)
+          if (build) build(chunk)
+          received = []
+          await new Promise(resolve => {
+            server.on('playerJoin', async (c) => {
+              client = c
+              await bot.test.pluginsLoaded
+              client.on('packet', (data, meta) => received.push({ name: meta.name, data }))
+              const login = registry.loginPacket
+              login.entityId = 0
+              client.write('login', login)
+              client.write('map_chunk', chunkPacket(chunk))
+              client.write('position', { x: 1.5, y: 65, z: 4.5, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: {}, teleportId: 0 })
+              client.write('update_health', { health: 20, food: 20, foodSaturation: 5 })
+              await once(bot, 'chunkColumnLoad')
+              await sleep(400) // lands on the floor
+              resolve()
+            })
+          })
+          bot.quickBarSlot = 0
+          lint = grimLint(bot, { players: new Set() })
+          received.length = 0
+        }
+
+        it('a movement key pressed with a window open closes the window first; the walk starts after the close_window', async () => {
+          await join()
+          const pWindows = require('prismarine-windows')(version)
+          const chestData = pWindows.windows['minecraft:generic_9x3'] ?? { type: 'minecraft:chest', slots: 63 }
+          client.write('open_window', { windowId: 1, inventoryType: chestData.type, windowTitle: chatText(''), slotCount: chestData.slots - 36, entityId: 0 })
+          client.write('window_items', { windowId: 1, stateId: 1, items: Array.from({ length: chestData.slots }, () => Item.toNotch(null)), carriedItem: Item.toNotch(null) })
+          await once(bot, 'windowOpen')
+          assert.ok(bot.currentWindow)
+          received.length = 0
+          let closedFor = null
+          bot.once('windowClosedForMovement', w => { closedFor = w })
+          bot.setControlState('forward', true)
+          await bot.waitForTicks(6)
+          const close = names(received).indexOf('close_window')
+          assert.ok(close >= 0, `no close_window in ${names(received).join(' ')}`)
+          assert.strictEqual(bot.currentWindow, null)
+          assert.ok(closedFor, 'the event fired')
+          const input = received.findIndex(p => p.name === 'player_input' && p.data.inputs.forward)
+          assert.ok(input > close, 'the first forward input is after the close')
+          const moved = received.findIndex(p => (p.name === 'position' || p.name === 'position_look') && Math.abs(p.data.z - 4.5) > 1e-9)
+          assert.ok(moved > close, 'the first position that moved is after the close')
+          assert.ok(bot.entity.position.z > 4.5 + 0.05, 'and then it walks (south, +z)')
+          assert.deepStrictEqual(lint.violations, [])
+        })
+
+        it('keys already reported as held when a window opens: the release goes out first, the close_window a tick later', async () => {
+          await join()
+          bot.setControlState('forward', true)
+          await bot.waitForTicks(3)
+          const pWindows = require('prismarine-windows')(version)
+          const chestData = pWindows.windows['minecraft:generic_9x3'] ?? { type: 'minecraft:chest', slots: 63 }
+          client.write('open_window', { windowId: 1, inventoryType: chestData.type, windowTitle: chatText(''), slotCount: chestData.slots - 36, entityId: 0 })
+          client.write('window_items', { windowId: 1, stateId: 1, items: Array.from({ length: chestData.slots }, () => Item.toNotch(null)), carriedItem: Item.toNotch(null) })
+          await once(bot, 'windowOpen')
+          received.length = 0
+          await bot.waitForTicks(4)
+          const order = names(received).filter(n => n === 'player_input' || n === 'close_window')
+          assert.deepStrictEqual(order.slice(0, 2), ['player_input', 'close_window'], 'the zero input is out before the close')
+          assert.strictEqual(received.find(p => p.name === 'player_input').data.inputs.forward, false)
+          assert.deepStrictEqual(lint.violations, [])
+        })
+
+        it('sprinting, then starting to eat: stop_sprinting goes out in the tick the use starts, and the sprint resumes after the release', async () => {
+          await join()
+          bot.food = 10
+          bot.inventory.updateSlot(bot.QUICK_BAR_START, new Item(registry.itemsByName.bread.id, 3))
+          bot.setControlState('forward', true)
+          bot.setControlState('sprint', true)
+          await bot.waitForTicks(4)
+          assert.strictEqual(bot.sprinting, true)
+          received.length = 0
+          await bot.activateItem()
+          await bot.waitForTicks(2)
+          const use = names(received).indexOf('use_item')
+          const stop = received.findIndex(p => p.name === 'entity_action' && p.data.actionId === entityActionId(registry, 'stop_sprinting'))
+          assert.ok(use >= 0 && stop > use, `use_item ${use}, stop_sprinting ${stop}`)
+          assert.ok(!names(received).slice(use, stop).includes('tick_end'), 'in the same tick')
+          assert.strictEqual(bot.sprinting, false)
+          await bot.waitForTicks(3)
+          assert.strictEqual(bot.sprinting, false, 'not while eating')
+          await bot.deactivateItem()
+          await bot.waitForTicks(3)
+          assert.strictEqual(bot.sprinting, true)
+          assert.deepStrictEqual(lint.violations, [])
+        })
+
+        it('sneaking stops a sprint a tick after the key (the crouch lags the key) and a crouched bot does not start one', async () => {
+          await join()
+          bot.setControlState('forward', true)
+          bot.setControlState('sprint', true)
+          await bot.waitForTicks(4)
+          assert.strictEqual(bot.sprinting, true)
+          bot.setControlState('sneak', true)
+          await bot.waitForTicks(1)
+          assert.strictEqual(bot.sprinting, true, 'the pose is still standing in the tick of the key')
+          await bot.waitForTicks(2)
+          assert.strictEqual(bot.sprinting, false)
+          assert.strictEqual(bot.pose, 'crouching')
+          assert.strictEqual(bot.entity.height, 1.5)
+          assert.strictEqual(bot.entity.eyeHeight, F(1.27))
+          bot.setControlState('sneak', false)
+          await bot.waitForTicks(4)
+          assert.strictEqual(bot.sprinting, true)
+          assert.strictEqual(bot.entity.height, F(1.8))
+          assert.deepStrictEqual(lint.violations, [])
+        })
+
+        it('swims: sprint starts under water, the pose becomes the 0.6 box, a teleport keeps it, and it stands again after the sprint', async () => {
+          await join(chunk => {
+            for (let x = 0; x < 16; x++) for (let z = 0; z < 16; z++) for (let y = 65; y <= 70; y++) chunk.setBlockType(new Vec3(x, y, z), registry.blocksByName.water.id)
+          })
+          bot.food = 20
+          bot.setControlState('forward', true)
+          bot.setControlState('sprint', true)
+          await bot.waitForTicks(8)
+          assert.strictEqual(bot.sprinting, true)
+          assert.strictEqual(bot.pose, 'swimming')
+          assert.strictEqual(bot.entity.height, F(0.6))
+          assert.strictEqual(bot.entity.eyeHeight, F(0.4))
+          const actions = received.filter(p => p.name === 'entity_action').map(p => p.data.actionId)
+          assert.deepStrictEqual(actions, [entityActionId(registry, 'start_sprinting')], 'start_sprinting once, never stopped')
+          assert.ok(bot.entity.position.z > 4.5 + 0.3, 'swims forward')
+          client.write('position', { x: 1.5, y: 66, z: 2.5, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: {}, teleportId: 1 })
+          await bot.waitForTicks(2)
+          assert.strictEqual(bot.entity.height, F(0.6), 'a teleport keeps the pose')
+          // letting go of the sprint key changes nothing (a swimmer keeps sprinting); letting go of forward, off the floor, ends it
+          bot.setControlState('sprint', false)
+          await bot.waitForTicks(3)
+          assert.strictEqual(bot.sprinting, true)
+          bot.setControlState('forward', false)
+          await bot.waitForTicks(5)
+          assert.strictEqual(bot.sprinting, false)
+          assert.strictEqual(bot.pose, 'standing')
+          assert.strictEqual(bot.entity.height, F(1.8))
+          assert.deepStrictEqual(lint.violations, [])
+        })
+
+        it('wading with the head out of the water does not sprint', async () => {
+          await join(chunk => {
+            for (let x = 0; x < 16; x++) for (let z = 0; z < 16; z++) chunk.setBlockType(new Vec3(x, 65, z), registry.blocksByName.water.id)
+          })
+          bot.food = 20
+          bot.setControlState('forward', true)
+          bot.setControlState('sprint', true)
+          await bot.waitForTicks(6)
+          assert.strictEqual(bot.sprinting, false)
+          assert.deepStrictEqual(received.filter(p => p.name === 'entity_action' && p.data.actionId === entityActionId(registry, 'start_sprinting')), [])
+        })
+      })
+    }
+  })
+
   // A bot with just what PlayerState reads
   function fakeBot (version, extra = {}) {
     const registry = require('prismarine-registry')(version)
