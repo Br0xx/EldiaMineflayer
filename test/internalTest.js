@@ -1788,7 +1788,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
           const writes = []
           bot._client.write = (name, params) => { writes.push({ name, params }) }
           const block = { position: vec3(1, 65, 1) }
-          await bot.activateBlock(block)
+          await bot.activateBlock(block, vec3(0, 1, 0))
           await bot.activateBlock(block, vec3(-1, 0, 0))
           try {
             const scale = bot.supportFeature('blockPlaceHasHandAndFloatCursor') || bot.supportFeature('blockPlaceHasInsideBlock') ? 1 : 16
@@ -1802,6 +1802,201 @@ for (const supportedVersion of mineflayer.testedVersions) {
           }
         })
       })
+    })
+
+    describe('vanilla interact', () => {
+      const Item = require('prismarine-item')(supportedVersion)
+      const pWindows = require('prismarine-windows')(supportedVersion)
+      const chestData = pWindows.windows['minecraft:generic_9x3'] ?? { type: 'minecraft:chest', slots: 63 }
+      const hasSequence = registry.version['>=']('1.19') // block_place carries a sequence number since 1.19
+
+      // Stone floor at y = 64, the bot standing at (1.5, 65, 4.5), a chest at (1, 65, 2) and a stone block buried at (1, 63, 2)
+      const chestPos = vec3(1, 65, 2)
+      const buriedPos = vec3(1, 63, 2)
+      async function joinWithWorld (onBlockPlace) {
+        const chunk = bot.test.buildChunk()
+        for (let x = 0; x < 16; x++) for (let z = 0; z < 16; z++) chunk.setBlockType(vec3(x, 64, z), registry.blocksByName.stone.id)
+        chunk.setBlockType(vec3(1, 63, 2), registry.blocksByName.stone.id)
+        chunk.setBlockType(chestPos, registry.blocksByName.chest.id)
+        const received = []
+        await new Promise(resolve => {
+          server.on('playerJoin', async (client) => {
+            await bot.test.pluginsLoaded
+            client.write('login', bot.test.generateLoginPacket())
+            client.write('map_chunk', generateChunkPacket(chunk))
+            client.write('position', {
+              x: 1.5,
+              y: 65,
+              z: 4.5,
+              dx: 0,
+              dy: 0,
+              dz: 0,
+              yaw: 0,
+              pitch: 0,
+              flags: bot.registry.version['>=']('1.21.3') ? {} : 0,
+              teleportId: 0
+            })
+            client.on('packet', (data, meta) => {
+              received.push({ name: meta.name, data, at: Date.now() })
+              if (meta.name === 'block_place' && onBlockPlace) onBlockPlace(client, data)
+            })
+            await once(bot, 'chunkColumnLoad')
+            await sleep(300) // lands on the floor
+            resolve()
+          })
+        })
+        return received
+      }
+
+      it('clickBlock reports the face and point the ray-cast hits, after turning, with a sequence number', async function () {
+        if (!hasSequence) return this.skip()
+        const received = await joinWithWorld()
+        const block = bot.blockAt(chestPos)
+
+        const result = await bot.vanilla.clickBlock(block)
+        await sleep(200)
+        assert.strictEqual(result.ok, true)
+        const click = received.find(p => p.name === 'block_place')
+        assert.ok(click, 'no block_place packet')
+        // the south face is the one an eye at z = 4.5 can see; a chest is 14/16 wide, so that face is at 15/16
+        assert.strictEqual(click.data.direction, 3)
+        assert.ok([0, 'main_hand'].includes(click.data.hand))
+        assert.ok(click.data.sequence > 0, 'a predicted action carries a sequence number')
+        assert.ok(Math.abs(click.data.cursorZ - 0.9375) < 1e-9, `cursorZ ${click.data.cursorZ} must lie on the south face`)
+        for (const c of [click.data.cursorX, click.data.cursorY]) assert.ok(c >= 0 && c <= 1)
+        assert.deepStrictEqual(received.slice(received.indexOf(click), received.indexOf(click) + 2).map(p => p.name), ['block_place', 'arm_animation'])
+
+        // the rotation the bot ended with really points at the reported point
+        const eye = bot.entity.position.offset(0, bot.entity.eyeHeight, 0)
+        const { yaw, pitch } = bot.entity
+        const dir = vec3(-Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch))
+        const reported = chestPos.offset(click.data.cursorX, click.data.cursorY, click.data.cursorZ)
+        const t = (reported.z - eye.z) / dir.z
+        assert.ok(eye.plus(dir.scaled(t)).distanceTo(reported) < 1e-6, 'rotation does not hit the reported point')
+        // and the rotation reached the server before the click (a turn sent with, or after, the click is not vanilla)
+        const lastLook = received.slice(0, received.indexOf(click)).reverse().find(p => ['look', 'position_look'].includes(p.name))
+        assert.ok(lastLook, 'no rotation was sent before the click')
+        const { toNotchianYaw, toNotchianPitch } = require('../lib/conversions')
+        assert.ok(Math.abs(lastLook.data.yaw - toNotchianYaw(yaw)) < 0.01 && Math.abs(lastLook.data.pitch - toNotchianPitch(pitch)) < 0.01,
+          `the click was sent with the server at ${lastLook.data.yaw}/${lastLook.data.pitch}, not at the aim`)
+
+        // a second click gets a higher sequence number
+        await bot.vanilla.clickBlock(block)
+        await sleep(100)
+        const clicks = received.filter(p => p.name === 'block_place')
+        assert.ok(clicks[1].data.sequence > clicks[0].data.sequence)
+      })
+
+      it('clickBlock and activateBlock refuse a block that is out of reach or not visible', async function () {
+        if (!hasSequence) return this.skip()
+        const received = await joinWithWorld()
+
+        assert.deepStrictEqual(await bot.vanilla.clickBlock(bot.blockAt(vec3(1, 65, 12))), { ok: false, reason: 'too-far' })
+        // under the floor: within reach once the reach is raised, but the floor is in the way
+        assert.deepStrictEqual(await bot.vanilla.clickBlock(bot.blockAt(buriedPos), { reach: 6 }), { ok: false, reason: 'no-sight' })
+        await assert.rejects(bot.activateBlock(bot.blockAt(vec3(1, 65, 12))), err => err.code === 'too-far')
+        await sleep(100)
+        assert.strictEqual(received.filter(p => p.name === 'block_place').length, 0)
+      })
+
+      it('activateBlock with an explicit face keeps that face', async function () {
+        if (!hasSequence) return this.skip()
+        const received = await joinWithWorld()
+        await bot.activateBlock(bot.blockAt(chestPos), vec3(1, 0, 0), vec3(1, 0.25, 0.75))
+        await sleep(100)
+        const click = received.find(p => p.name === 'block_place')
+        assert.strictEqual(click.data.direction, 5)
+        assert.deepStrictEqual([click.data.cursorX, click.data.cursorY, click.data.cursorZ], [1, 0.25, 0.75])
+      })
+
+      it('openContainer keeps containerSpacingMs between opens and closes the previous window', async function () {
+        if (!hasSequence) return this.skip()
+        let windowId = 0
+        const received = await joinWithWorld((client) => {
+          windowId++
+          client.write('open_window', { windowId, inventoryType: chestData.type, windowTitle: chatText(''), slotCount: chestData.slots - 36, entityId: 0 })
+          client.write('window_items', {
+            windowId,
+            stateId: 1,
+            items: Array.from({ length: chestData.slots }, () => Item.toNotch(null)),
+            carriedItem: Item.toNotch(null)
+          })
+        })
+        bot.vanilla.options.containerSpacingMs = 600
+        const block = bot.blockAt(chestPos)
+
+        const first = await bot.openContainer(block)
+        const firstOpenedAt = Date.now()
+        const second = await bot.vanilla.openContainer(block)
+        const gap = Date.now() - firstOpenedAt
+        assert.ok(gap >= 590, `second window opened ${gap} ms after the first`)
+        assert.notStrictEqual(first, second)
+        assert.strictEqual(typeof second.close, 'function', 'the window is extended like openBlock\'s')
+        const names = received.map(p => p.name)
+        assert.ok(names.indexOf('close_window') > names.indexOf('block_place'), 'the first window is closed before the next open')
+        assert.strictEqual(names.lastIndexOf('block_place') > names.indexOf('close_window'), true)
+      })
+
+      it('openContainer times out with the replies the server sent', async function () {
+        if (!hasSequence) return this.skip()
+        await joinWithWorld((client, data) => client.write('acknowledge_player_digging', { sequenceId: data.sequence }))
+        bot.vanilla.options.openTimeoutMs = 300
+        await assert.rejects(bot.vanilla.openContainer(bot.blockAt(chestPos)), err => {
+          assert.strictEqual(err.code, 'timeout')
+          assert.match(err.message, /no window within 0\.3 s \(server sent: ack \d+\)/)
+          return true
+        })
+      })
+
+      it('options can be overridden through createBot', () => {
+        const other = mineflayer.createBot({ username: 'other', version: supportedVersion, port: PORT, vanilla: { interact: { reach: 4.5, clickGapMs: 10 } } })
+        return new Promise(resolve => other.once('inject_allowed', () => {
+          // plugins are injected on the next timer tick
+          setTimeout(() => {
+            assert.deepStrictEqual(other.vanilla.options, { reach: 4.5, settleTicks: 2, containerSpacingMs: 1500, openTimeoutMs: 8000, clickGapMs: 10 })
+            other.end()
+            resolve()
+          }, 10)
+        }))
+      })
+    })
+
+    describe('swap hands', () => {
+      it('swapHands writes block_dig status 6 with sequence 0', async function () {
+        if (bot.supportFeature('doesntHaveOffHandSlot')) return this.skip()
+        server.on('playerJoin', (client) => client.write('login', bot.test.generateLoginPacket()))
+        await once(bot, 'login')
+        await bot.test.pluginsLoaded
+        const writes = []
+        bot._client.write = (name, params) => { writes.push({ name, params }) }
+        bot._nextSequence() // vanilla numbers predicted actions only: the counter has moved on, swap hands stays 0
+        bot.vanilla.swapHands()
+        assert.strictEqual(writes.length, 1)
+        assert.strictEqual(writes[0].name, 'block_dig')
+        assert.strictEqual(writes[0].params.status, 6)
+        if (hasSequenceField()) assert.strictEqual(writes[0].params.sequence, 0)
+      })
+
+      it('offhandFromHotbar selects the slot, swaps hands and selects the previous slot again', async function () {
+        if (bot.supportFeature('doesntHaveOffHandSlot')) return this.skip()
+        server.on('playerJoin', (client) => client.write('login', bot.test.generateLoginPacket()))
+        await once(bot, 'login')
+        await bot.test.pluginsLoaded
+        bot.quickBarSlot = 0 // the server selects a slot on join
+        bot.inventory.updateSlot(bot.QUICK_BAR_START + 3, new Item(registry.itemsByName.totem_of_undying.id, 1))
+        const writes = []
+        bot._client.write = (name, params) => { writes.push({ name, params }) }
+        bot.waitForTicks = async () => {} // no world, so no physics ticks
+        const found = await bot.vanilla.offhandFromHotbar(item => item.name === 'totem_of_undying')
+        const relevant = writes.filter(w => ['held_item_slot', 'block_dig'].includes(w.name))
+        assert.strictEqual(found, true)
+        assert.deepStrictEqual(relevant.map(w => [w.name, w.params.slotId ?? w.params.status]), [['held_item_slot', 3], ['block_dig', 6], ['held_item_slot', 0]])
+        assert.strictEqual(await bot.vanilla.offhandFromHotbar(item => item.name === 'diamond'), false)
+      })
+
+      function hasSequenceField () {
+        return registry.version['>=']('1.19')
+      }
     })
 
     describe('activateItem', () => {

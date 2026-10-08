@@ -33,6 +33,80 @@ export interface BotOptions extends ClientOptions {
   brand?: string
   defaultChatPatterns?: boolean
   respawn?: boolean
+  /** Settings of the vanilla-client behaviour */
+  vanilla?: VanillaOptions
+  /**
+   * Skip packets protodef cannot decode (9b9t's ViaBackwards sends some) instead of dropping the bot.
+   * The count is `protodefSkipped()`.
+   * @default true
+   */
+  skipUndecodablePackets?: boolean
+  /**
+   * Turn off the socket idle timeout after login (queue lag can exceed it); keep-alives are the health check.
+   * @default true
+   */
+  socketTimeoutAfterLogin?: boolean
+  /**
+   * Milliseconds without a keep-alive after which the connection is dropped.
+   * @default 60000
+   */
+  checkTimeoutInterval?: number
+}
+
+export interface VanillaOptions {
+  /** Overrides for `bot.vanilla.options` */
+  interact?: Partial<VanillaInteractOptions>
+}
+
+export interface VanillaInteractOptions {
+  /** Max distance from the eyes to the clicked point (vanilla allows 4.5) @default 3 */
+  reach: number
+  /** Ticks to wait after turning before clicking, so the rotation has reached the server @default 2 */
+  settleTicks: number
+  /** Minimum time between two container opens @default 1500 */
+  containerSpacingMs: number
+  /** How long to wait for a container window @default 8000 */
+  openTimeoutMs: number
+  /** Pause between two inventory clicks @default 150 */
+  clickGapMs: number
+}
+
+export type VanillaClickResult =
+  | { ok: true, face: number, cursor: Vec3 }
+  | { ok: false, reason: 'too-far' | 'no-sight' }
+
+/** Block and inventory interactions the way a vanilla client makes them (`bot.vanilla`) */
+export interface VanillaInteract {
+  options: VanillaInteractOptions
+  /**
+   * Right-click a block: stand still, look at a visible point, wait `settleTicks`, ray-cast and send the
+   * face and cursor the ray hits. Resolves with `ok: false` if the block is out of reach or not visible.
+   */
+  clickBlock: (block: Block, options?: Partial<VanillaInteractOptions>) => Promise<VanillaClickResult>
+  /** The error `activateBlock`/`openContainer` throw for a refused click (`code`: 'too-far' or 'no-sight') */
+  clickError: (result: { ok: false, reason: 'too-far' | 'no-sight' }) => Error & { code: string }
+  /**
+   * Open a container block. Keeps `containerSpacingMs` between opens, closes a window that comes late, and
+   * rejects (`code: 'timeout'`) listing what the server answered. Concurrent calls queue up.
+   */
+  openContainer: (block: Block, options?: Partial<VanillaInteractOptions>) => Promise<Window>
+  /** Close the open window, if any (do this before walking) */
+  closeAnyWindow: () => void
+  /** Wait until the bot stands on the ground without horizontal speed; resolves false after `maxTicks` @default 20 */
+  standStill: (maxTicks?: number) => Promise<boolean>
+  /** Look at a point and wait for the rotation to reach the server */
+  lookSettled: (point: Vec3, ticks?: number) => Promise<void>
+  /** A point on the block the eyes can see within reach, or null */
+  visiblePoint: (block: Block, reach?: number) => Vec3 | null
+  /** One inventory click followed by a `clickGapMs` pause */
+  windowClick: (slot: number, mouseButton: number, mode: number, options?: Partial<VanillaInteractOptions>) => Promise<void>
+  shiftClick: (slot: number, options?: Partial<VanillaInteractOptions>) => Promise<void>
+  /** The swap-hands key (block_dig status 6, sequence 0) */
+  swapHands: () => void
+  /** Move a matching hotbar item to the offhand with swap-hands; false if none is in the hotbar */
+  offhandFromHotbar: (match: (item: Item) => boolean) => Promise<boolean>
+  /** Move a matching main-inventory item to the hotbar with a number-key click; resolves with the hotbar index or -1 */
+  toHotbar: (match: (item: Item) => boolean, options?: Partial<VanillaInteractOptions>) => Promise<number>
 }
 
 export type ChatLevel = 'enabled' | 'commandsOnly' | 'disabled'
@@ -199,6 +273,7 @@ export interface Bot extends TypedEmitter<BotEvents> {
   oxygenLevel: number
   physics: PhysicsOptions
   physicsEnabled: boolean
+  vanilla: VanillaInteract
   abilities: Abilities
   time: Time
   quickBarSlot: number
@@ -910,3 +985,7 @@ export let latestSupportedVersion: string
 export let oldestSupportedVersion: string
 
 export function supportFeature (feature: string, version: string): boolean
+
+/** Number of undecodable packets skipped so far (see `skipUndecodablePackets`) */
+export function protodefSkipped (): number
+export function installProtodefGuard (): boolean
