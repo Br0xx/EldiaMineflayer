@@ -1,7 +1,7 @@
 {
-  "name": "mineflayer",
-  "version": "4.39.0",
-  "description": "create minecraft bots with a stable, high level API",
+  "name": "9bflayer",
+  "version": "0.1.0",
+  "description": "9bFlayer: a mineflayer fork that plays like the vanilla client, built to pass the Grim anticheat (9b9t). Drop-in for mineflayer 4.39.",
   "main": "index.js",
   "types": "index.d.ts",
   "scripts": {
@@ -10,11 +10,11 @@
     "pretest": "npm run lint",
     "lint": "standard && standard-markdown",
     "fix": "standard --fix && standard-markdown --fix",
-    "prepublishOnly": "cp docs/README.md README.md"
+    "prepublishOnly": "true"
   },
   "repository": {
     "type": "git",
-    "url": "git://github.com/PrismarineJS/mineflayer.git"
+    "url": "git+https://github.com/Br0xx/EldiaMineflayer.git"
   },
   "engines": {
     "node": ">=22"
@@ -31,7 +31,6 @@
     "prismarine-entity": "^2.5.0",
     "prismarine-item": "^1.17.0",
     "prismarine-nbt": "^2.0.0",
-    "prismarine-physics": "^1.11.1",
     "prismarine-recipe": "^1.5.0",
     "prismarine-registry": "^1.10.0",
     "prismarine-windows": "^2.9.0",
@@ -51,5 +50,15 @@
     "standard": "^17.0.0",
     "standard-markdown": "^7.1.0",
     "typescript": "^5.4.5"
-  }
+  },
+  "keywords": [
+    "minecraft",
+    "mineflayer",
+    "bot",
+    "grim",
+    "anticheat",
+    "vanilla",
+    "9b9t"
+  ],
+  "mineflayerBase": "4.39.0"
 }
