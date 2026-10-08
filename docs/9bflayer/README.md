@@ -37,3 +37,8 @@ Nothing of this fork itself has run against a live Grim yet.
   (weaving), riptide, creative flight, and 26.2 geysers.
 - The sneak edge back-off follows Grim's shifted box. Vanilla 1.20.5+ may use `canFallAtLeast`, which differs only
   against a wall at an edge.
+- Digging sends FINISH `ceil(1 / progress per tick)` ticks after START. Vanilla may add progress in the START tick
+  too, which would make it one tick sooner. The later timing never beats Grim's FastBreak prediction; check it live.
+- Two aimed actions at different targets at the same time are refused (the second look wins), not raced.
+- The reach attribute keys on 1.20.5 to 1.21.1 are guessed (minecraft-data is stale there). The fallback is 4.5 for
+  blocks and 3.0 for entities.

@@ -83,6 +83,12 @@ The promises of these APIs settle after that tick, so a call now takes up to 50 
 - **Containers:** opens are spaced 1.5 s apart, because 9b9t silently ignores faster ones. A window that arrives too
   late is closed.
 - **Offhand:** `bot.vanilla.swapHands()`, `offhandFromHotbar()` and `toHotbar()` move items the way a player does.
+- **Digging, attacking and placing aim first.**
+  - `bot.dig` looks at the block and lets the rotation settle, then digs the face the crosshair hits. It swings every
+    tick, sends FINISH on the tick the block breaks, and waits vanilla's 5 ticks before the next block.
+  - `attack`, `useOn` and `activateEntity` aim at the hitbox and check the reach (3.0) and the ray when they write.
+  - Placing re-checks the ray at write time. They reject with `err.code` set to `too-far`, `no-sight`, `gone` or
+    `moved` rather than send a click no player could make.
 - **Window clicks and closes** wait until no movement key is held (Grim flags inventory clicks while moving). They
   reject after 40 ticks if a key stays held, so release the keys first (`bot.clearControlStates()`), as
   mineflayer-pathfinder does when it stops.
