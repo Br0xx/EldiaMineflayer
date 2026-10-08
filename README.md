@@ -1,0 +1,134 @@
+# 9bFlayer
+
+A fork of [mineflayer](https://github.com/PrismarineJS/mineflayer) 4.39 whose bots play like the vanilla client, so
+the [Grim](https://github.com/GrimAnticheat/Grim) anticheat has nothing to flag. Built for 9b9t (1.21.4 behind
+ViaBackwards), and it speaks Minecraft 1.8 to **26.2**.
+
+It is a drop-in replacement: same API, same events, same plugins (mineflayer-pathfinder and friends work).
+The upstream docs in [docs/](docs/README.md) still apply. This file lists what is different.
+
+```js
+const mineflayer = require('9bflayer')
+const bot = mineflayer.createBot({ host: '9b9t.org', username: 'Bot', auth: 'microsoft', version: '1.21.4' })
+```
+
+Install from git until it is published: `npm install github:Br0xx/EldiaMineflayer#9bflayer`. Needs Node 22.
+
+## Why
+
+Grim re-simulates every movement a client reports with vanilla's own physics and checks the order of the packets
+inside each tick. Stock mineflayer differs from the vanilla client in dozens of small ways. Each one is harmless alone,
+but Grim answers a mismatch with a setback, and on 9b9t that meant a bot that could not walk up a staircase or open a
+row of chests. The fixes started as switchable patches in EBS Lab, where each was proven live on 9b9t
+([GRIM.md](https://github.com/Br0xx/EBSlab/blob/main/engine/patches/GRIM.md)). Here they are native, and the rest of
+the client was audited against Grim's source.
+
+## What is different from mineflayer
+
+**Movement (1.21+, `lib/physics/`).** The physics engine is vendored and does what the 1.21.x client does, line by
+line:
+
+- float arithmetic where vanilla uses floats;
+- the `Mth` sin/cos lookup table (the new table from 1.21.11);
+- the float hitbox (half-width 0.30000001192…);
+- 1.21's collision and step-up;
+- the tiny-move and velocity-zeroing rules of 1.21.2 and 1.21.5;
+- soul sand and honey;
+- item-use slowdown;
+- fluid current averaging;
+- sprint-swimming;
+- the full climbable set;
+- server attributes (speed, slowness, jump strength, gravity…).
+
+Walking from rest gives 0.098, 0.1515, 0.1807 blocks per tick and a jump 0.42, 0.7532, 1.0013, 1.1661, 1.2492, the
+values recorded on 9b9t. Versions before 1.21 keep prismarine-physics' behaviour.
+
+**One tick, in vanilla order (`lib/plugins/input_queue.js`, `physics.js`).** API calls no longer write packets the
+moment they run. Every action is queued and goes out inside the next tick, in the order the vanilla client writes
+them:
+
+1. pongs and teleport/rotation replies;
+2. held slot;
+3. swap/drop;
+4. one primary action (use, attack, dig, place) with its swing;
+5. `player_input` (whenever the held keys change), then sneak, then sprint;
+6. the movement packet;
+7. `tick_end`.
+
+The promises of these APIs settle after that tick, so a call now takes up to 50 ms longer.
+
+**Movement packets.**
+
+- **Rotation:** each movement packet carries exactly the rotation its tick was simulated with. The yaw is unwrapped,
+  pitch is clamped to ±90 after the sensitivity rounding, and there is no easing by default.
+- **When a packet is sent:** a position goes out when the bot moved more than 2e-4 blocks, or on the 20th tick. A
+  status-only packet goes out when the ground or the wall-collision flag changes, and the collision flag is the real
+  one.
+- **Teleports:** the bot stays on the ground after a setback, and `player_rotation` is answered like vanilla.
+- **After a stall:** a catch-up burst is capped at 2 ticks, for Grim's Timer check.
+
+**Sprint and sneak are state.**
+
+- Sprint starts and stops by vanilla's rules: forward input, food > 6, a wall in the way, item use, water. The sprint
+  key only asks for it.
+- Sneak goes out as `entity_action` below 1.21.6, which is where a 1.21.4 server reads it.
+- `entity_action` ids are looked up by meaning for each version (`lib/entity_action.js`). On stock mineflayer, sprint
+  on 1.21.6+ is sent as "start riding jump".
+
+**Clicks like a player (`bot.vanilla`).**
+
+- **Clicking a block:** `bot.activateBlock` and `bot.openContainer` without an explicit face stand still, look at a
+  visible point and wait for the rotation to reach the server. They then ray-cast from the eyes and click the face and
+  point the crosshair hits, from within 3 blocks.
+- **Containers:** opens are spaced 1.5 s apart, because 9b9t silently ignores faster ones. A window that arrives too
+  late is closed.
+- **Offhand:** `bot.vanilla.swapHands()`, `offhandFromHotbar()` and `toHotbar()` move items the way a player does.
+- **Window clicks and closes** wait until no movement key is held.
+
+**Connection defaults for 9b9t.**
+
+- Packets protodef can't decode (ViaBackwards) are skipped instead of dropping the bot.
+- The keep-alive check is 60 s, and there is no socket idle timeout after login.
+- A login that completes after `bot.end()` is killed before it reaches the server.
+
+**mineflayer-pathfinder without the snap.** `require('9bflayer/pathfinder').loadPathfinder()` loads your installed
+mineflayer-pathfinder with a `fullStop()` that releases the keys instead of teleporting the bot onto the block centre.
+
+**Minecraft 26.2.** Data from minecraft-data's 26.2 branch, registered at load time (`lib/mcdata/`). It does nothing
+once minecraft-data ships 26.2.
+
+**Fixed along the way:**
+
+- server attributes never reached the physics on 1.21+, because minecraft-data's key table is stale;
+- 1.21.9+ knockback was divided by 8000 twice;
+- soul sand never slowed on 1.15–1.21;
+- `bed.wake()` sent stop-sprinting on 1.21.6+.
+
+## Options
+
+| `createBot` option | Default | |
+|---|---|---|
+| `skipUndecodablePackets` | `true` | skip packets protodef can't decode instead of disconnecting |
+| `checkTimeoutInterval` | `60000` | keep-alive timeout (mineflayer: 30 s) |
+| `socketTimeoutAfterLogin` | `true` | turn off the socket idle timeout once logged in |
+| `hideErrors` | `true` | don't dump undecodable packets to the console |
+| `maxCatchupTicks` | `2` | ticks replayed after an event-loop stall |
+| `vanilla.interact` | `{ reach: 3, settleTicks: 2, containerSpacingMs: 1500, openTimeoutMs: 8000, clickGapMs: 150 }` | `bot.vanilla` click settings |
+
+`bot.physics.yawSpeed` / `pitchSpeed` (rad/s) bring back eased turning when given a finite value.
+
+## Development
+
+```bash
+npm install
+npx standard                                   # lint
+npx mocha --exit test/physicsVanillaTest.js test/internalTest.js test/vanillaUnitTest.js -g "9bflayer|1.21.4v|26.1v|26.2v"
+```
+
+The tests run offline against minecraft-protocol's server. `test/grimLint.js` replays Grim's packet-order rules over
+everything a test bot sends, and `test/physicsVanillaTest.js` checks the engine against vanilla numbers.
+
+Nothing here has a local Grim to run against. Live testing happens on 9b9t through EBS Lab, and every finding goes
+into [docs/9bflayer/](docs/9bflayer/), together with the Grim audits the changes came from.
+
+MIT, like mineflayer.

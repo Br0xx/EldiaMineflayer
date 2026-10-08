@@ -4,7 +4,7 @@ node_modules
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
-/README.md
+# /README.md is 9bFlayer's own (upstream generated it from docs/README.md at publish time)
 versions/
 server_jars/
 test/server_*
