@@ -63,6 +63,14 @@ for (const supportedVersion of mineflayer.testedVersions) {
         version: supportedVersion,
         port: PORT
       })
+      // 26.2's login success carries a session id that minecraft-protocol's server doesn't fill in yet.
+      server.on('connection', client => {
+        const write = client.write
+        client.write = function (name, params) {
+          if (name === 'success' && params.sessionId === undefined) params = { ...params, sessionId: require('crypto').randomUUID() }
+          return write.call(this, name, params)
+        }
+      })
       await once(server, 'listening')
       bot = mineflayer.createBot({
         username: 'player',
